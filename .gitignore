@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Screenshots / debug images
+bot/*.png
+bot/screenshots/
+
+# Debug / scratch scripts
+bot/debug_*.py
+bot/auto_intercept.py
+bot/scan_bundle.py
+bot/probe_ips.py
+bot/probe_detail.py
+bot/probe2.py
+bot/interceptor.py
+
+# Captured data files
+bot/api_candidates.json
+bot/endpoint_summary.json
+bot/endpoints.json
+
+# Research notes and reports (generated output)
+research_notes/
+reports/
+
+# Secrets / env
+.env
+*.key
