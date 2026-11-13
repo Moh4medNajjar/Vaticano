@@ -21,18 +21,20 @@ from proxy import ProxyManager
 
 logger = logging.getLogger(__name__)
 
-# Patches injected before page scripts run — suppress automation signals
-STEALTH_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-window.chrome = {runtime: {}};
-const origQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (params) =>
-    params.name === 'notifications'
-        ? Promise.resolve({state: Notification.permission})
-        : origQuery(params);
-"""
+# NOTE: playwright_stealth (used below via Stealth().use_async) already
+# installs a clean, toString-spoofed set of patches: navigator.webdriver=false
+# on the prototype (NOT the instance), plugins length=5, and native-looking
+# toString on patched methods. Verified via httpbin probe.
+#
+# Earlier versions of this file carried a hand-rolled STEALTH_SCRIPT that
+# layered on top of playwright_stealth and INTRODUCED two F5 tells:
+#   - navigator.webdriver became an OWN property returning undefined
+#     (real Chrome has it on the prototype returning false)
+#   - navigator.permissions.query.toString() returned our JS source instead of
+#     "function query() { [native code] }" — directly catches on F5's
+#     Function.prototype.toString spoof check.
+# Do not re-introduce it. If something needs patching beyond stealth, wrap
+# the patch with a toString proxy that returns the expected native string.
 
 # Intercepts Angular's AbstractControl.valid/status/invalid getters AT definition time.
 # We patch Object.defineProperty so that when Angular's bundle runs and defines these
@@ -100,10 +102,13 @@ ANGULAR_FORM_PATCH_SCRIPT = """
 })();
 """
 
+# Must match the actual Chromium version launched (verified via probe:
+# installed Chrome is 157). Mismatch between UA header and Chrome's
+# auto-populated sec-ch-ua: "Google Chrome";v="157" is a hard F5 signal.
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Chrome/157.0.0.0 Safari/537.36"
 )
 
 
@@ -127,6 +132,9 @@ class F5Session:
         self.proxy_mgr = proxy_mgr
         self._cookies: list[dict] = []
         self.turnstile_site_key: Optional[str] = "0x4AAAAAAB2Edz1zEK7o5Rj1"
+        # True after solve() returns if the Angular shell loaded (full F5 pass);
+        # False if the IP produced only a challenge page / dead connection.
+        self.challenge_passed: bool = False
         # live Playwright objects — kept open until close()
         self._stealth_ctx = None
         self._pw = None
@@ -141,33 +149,65 @@ class F5Session:
         await self.close()
 
     async def _launch(self):
+        """
+        Persistent Chrome profile per (proxy, user-data-dir). Inspired by the
+        Colosseo bot at test-workspace/fast/* which keeps clearance cookies in
+        a SQLite cache per proxy and seeds them on every session — the bot WAF
+        then sees "trusted browser accumulating activity" instead of 20 fresh
+        fingerprints an hour.
+
+        Our equivalent: Playwright's launchPersistentContext writes TSPD_101,
+        TSPD_101_DID, ticketmv, JSESSIONID etc. to disk. Next run reuses them —
+        Vatican sees the same browser that already cleared F5 doing one more
+        booking, not a brand-new session.
+
+        One profile per proxy to keep the cookie↔IP binding stable. We stick
+        to the first picked proxy for the profile's lifetime.
+        """
+        import hashlib as _hashlib
+        import pathlib as _pl
         from playwright_stealth import Stealth
+
+        proxy = self.proxy_mgr.playwright_proxy()
+        # Derive a per-proxy profile dir — one browser history per exit IP
+        if proxy and proxy.get("server"):
+            proxy_tag = _hashlib.sha1(
+                (proxy.get("server","") + (proxy.get("username") or "")).encode()
+            ).hexdigest()[:10]
+        else:
+            proxy_tag = "noproxy"
+        profiles_root = _pl.Path(__file__).resolve().parent.parent / ".pw_profiles"
+        profiles_root.mkdir(exist_ok=True)
+        user_data_dir = profiles_root / proxy_tag
+        is_fresh = not user_data_dir.exists()
+        logger.info("persistent profile: %s  (fresh=%s)", user_data_dir.name, is_fresh)
+        user_data_dir.mkdir(exist_ok=True)
+
+        # Stable viewport per profile (NOT random): randomness defeats the
+        # "same browser over time" signal we're trying to build.
+        viewport = {"width": 1536, "height": 864}
+
         self._stealth_ctx = Stealth().use_async(async_playwright())
         self._pw = await self._stealth_ctx.__aenter__()
-        try:
-            self._browser = await self._pw.chromium.launch(
-                channel="chrome",
-                headless=self.config.headless,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-        except Exception:
-            self._browser = await self._pw.chromium.launch(
-                headless=self.config.headless,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-        self._ctx = await self._browser.new_context(
+        launch_kwargs = dict(
+            user_data_dir=str(user_data_dir),
+            headless=self.config.headless,
+            args=["--disable-blink-features=AutomationControlled"],
             user_agent=UA,
-            proxy=self.proxy_mgr.playwright_proxy(),
-            viewport={"width": 1280, "height": 800},
+            viewport=viewport,
             locale="en-US",
+            timezone_id="Europe/Rome",
             ignore_https_errors=True,
+            proxy=proxy,
         )
-        # NOTE: ANGULAR_FORM_PATCH_SCRIPT intentionally NOT added here.
-        # The script patches Object.defineProperty and Function.prototype.toString,
-        # which interferes with Angular's page initialization (bodyLen=185, hasAngular=False).
-        # Instead we capture the FormGroup reference at runtime (window.__checkoutForm)
-        # during Phase 4E's MapGet interception and patch it directly in booking.py.
-        # await self._ctx.add_init_script(ANGULAR_FORM_PATCH_SCRIPT)
+        try:
+            self._ctx = await self._pw.chromium.launch_persistent_context(
+                channel="chrome", **launch_kwargs)
+        except Exception as exc:
+            logger.info("launch_persistent_context(channel=chrome) failed: %s — trying bundled Chromium", exc)
+            self._ctx = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
+        # No separate _browser when using persistent context — ctx IS the browser
+        self._browser = self._ctx.browser
 
     async def solve(self) -> dict:
         """
@@ -183,23 +223,34 @@ class F5Session:
         # which degrades the session enough that /api/visit/reservation is blocked.
         # The monitor navigates to the calendar via SPA (no F5 re-challenge).
         logger.info("Loading /home to solve F5 challenge…")
-        await self._page.goto(f"{BASE_URL}/home", wait_until="networkidle", timeout=60_000)
-        await self._wait_for_ts_cookie(self._page)
+        try:
+            await self._page.goto(f"{BASE_URL}/home", wait_until="networkidle", timeout=30_000)
+        except Exception as exc:
+            # ERR_TIMED_OUT / net errors mean the chosen Evomi IP is dead. Report
+            # so the caller can rotate without a long wait.
+            logger.warning("goto /home failed (dead IP?): %s", exc)
+            self.challenge_passed = False
+            self._cookies = []
+            return self.as_httpx_cookies()
+        try:
+            await self._wait_for_ts_cookie(self._page)
+        except TimeoutError:
+            logger.warning("TS cookie never arrived (hard F5 reject)")
+            self.challenge_passed = False
+            self._cookies = []
+            return self.as_httpx_cookies()
 
         # Verify Angular actually loaded (not just F5's challenge page).
-        # When F5's challenge page appears, bodyLen ≈ 185 bytes; the real Angular
-        # app is 60 KB+. If we're on the challenge page, wait for the automatic
-        # redirect to the real page (F5 redirects after the JS challenge completes).
+        # Angular shell is 60 KB+; F5 challenge page is ~6 KB; redirect stub is ~185 bytes.
+        # A good IP's challenge resolves in 2-4 s; cap the wait at 10 s so bad IPs
+        # fail fast and the caller can rotate to a warmer one.
         body_len = await self._page.evaluate("() => document.body.innerHTML.length")
+        self.challenge_passed = True   # optimistic; downgraded below if needed
         if body_len < 20_000:
-            # Angular app is 60 KB+. < 20 KB means we're still on the F5 challenge page
-            # (38 bytes = redirect stub, 4–5 KB = challenge JS page). Wait for the challenge
-            # JS to run and redirect us to the real page. Never reload — that restarts the
-            # challenge loop.
-            logger.info("F5 challenge JS running (bodyLen=%d) — waiting for Angular redirect…", body_len)
-            deadline = asyncio.get_event_loop().time() + 30
+            logger.info("F5 challenge JS running (bodyLen=%d) — waiting up to 10s for Angular…", body_len)
+            deadline = asyncio.get_event_loop().time() + 10
             while asyncio.get_event_loop().time() < deadline:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 try:
                     bl = await self._page.evaluate("() => document.body.innerHTML.length")
                     if bl >= 20_000:
@@ -208,9 +259,10 @@ class F5Session:
                 except Exception:
                     pass
             else:
-                logger.warning("Angular did not load after 30s wait (still on challenge page)")
+                logger.warning("Angular did not load within 10s — IP is cold, rotating is advised")
+                self.challenge_passed = False
 
-        logger.info("F5 challenge passed.")
+        logger.info("F5 solve finished  challenge_passed=%s", self.challenge_passed)
 
         await self._wait_for_session_cookie()
 
@@ -386,10 +438,11 @@ class F5Session:
                 pass
 
     async def close(self):
-        """Tear down browser and Playwright context."""
+        """Tear down the persistent context. The user-data-dir stays on disk
+        so cookies + storage persist for the next run."""
         try:
-            if self._browser:
-                await self._browser.close()
+            if self._ctx:
+                await self._ctx.close()
             if self._stealth_ctx:
                 await self._stealth_ctx.__aexit__(None, None, None)
         except Exception:

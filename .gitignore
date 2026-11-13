@@ -36,3 +36,13 @@ reports/
 # Secrets / env
 .env
 *.key
+proxies.txt
+proxies/
+scratch_rea/
+
+# Persistent Playwright profiles (per-proxy Chrome user data dirs — see session.py)
+.pw_profiles/
+
+# Telegram bot runtime state (buyer form + held slots). Rebuilt on first use.
+.held_slots.json
+.menu_state.json
