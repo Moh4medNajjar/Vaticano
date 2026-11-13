@@ -1,2 +1,7 @@
+# Vatican hold bot — runtime dependencies.
+# Install with: pip install -r requirements.txt && playwright install chromium
+
 playwright>=1.44.0
+playwright-stealth>=2.0.0
+python-telegram-bot>=22.0,<23.0
 httpx>=0.27.0
