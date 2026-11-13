@@ -697,10 +697,10 @@ def _menu_render(sel: MenuSel) -> InlineKeyboardMarkup:
         rows.append(
             [InlineKeyboardButton(f"👤 Buyer: {sel.first} {sel.last} ✏️",
                                   callback_data="m:buyer:show")])
-    # Fire / Cancel
+    # Fire / Back
     rows.append(
         [InlineKeyboardButton("✅ CATCH!", callback_data="m:fire"),
-         InlineKeyboardButton("❌ Cancel", callback_data="m:cancel")])
+         InlineKeyboardButton("↩ Back",   callback_data="top:back")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -794,18 +794,62 @@ def _date_picker(center: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def kbd(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+    """Shorthand for building keyboards from [(label, data), …] rows.
+    Mirrors botmanager/botmanager.py so the look is consistent across bots."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(label, callback_data=data) for label, data in row]
+         for row in rows])
+
+
+def _launcher_kbd() -> InlineKeyboardMarkup:
+    """Top-level launcher — one tap per task. Matches the botmanager style
+    (short labels, 2-wide rows, no walls of text)."""
+    return kbd([
+        [("🎟️ New catch", "top:catch"),  ("📦 My holds",  "top:held")],
+        [("👤 Buyer",      "top:buyer"),  ("📊 Status",    "top:status")],
+        [("❓ Help",        "top:help"),   ("✖ Close",      "top:close")],
+    ])
+
+
+def _launcher_text() -> str:
+    held_count = sum(1 for rs in HOLDS.values()
+                     if rs.proc and rs.proc.returncode is None)
+    sel  = MENU.get(AUTHORIZED_CHAT) or MenuSel()
+    missing = _buyer_missing(sel)
+    buyer_badge = ("✅ buyer complete" if not missing
+                   else f"⚠️ buyer incomplete ({len(missing)} missing)")
+    return (
+        "<b>🎟️ Vatican Catch Bot</b>\n"
+        "What do you want to do?\n\n"
+        f"📦 holding: <b>{held_count}</b> slot(s)\n"
+        f"👤 {buyer_badge}"
+    )
+
+
 @only_our_chat
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    sel = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
-    if not sel.date:
-        sel.date = _menu_default_date()
+    """Top-level launcher. Every other screen can get back here via ↩ Back."""
     await ctx.bot.send_message(
         chat_id=AUTHORIZED_CHAT,
-        text=_menu_text(sel),
-        reply_markup=_menu_render(sel),
+        text=_launcher_text(),
+        reply_markup=_launcher_kbd(),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
+
+
+async def _open_catch_config(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Replaces the message with the catch-config screen (date/time/tickets/mode).
+    Used by the launcher's 🎟️ New catch button."""
+    sel = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
+    if not sel.date:
+        sel.date = _menu_default_date()
+    try:
+        await q.message.edit_text(_menu_text(sel), parse_mode=ParseMode.HTML,
+                                  reply_markup=_menu_render(sel))
+    except Exception as exc:
+        log.debug("open_catch_config failed: %s", exc)
 
 
 @only_our_chat
@@ -826,13 +870,118 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if data == "noop":
         return
 
+    # ---------- top-level launcher ----------
+    if parts[0] == "top":
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "close":
+            try: await q.message.edit_text("✖ closed. /menu to reopen.")
+            except Exception: pass
+            return
+
+        if action == "back":
+            # Back to the launcher
+            try:
+                await q.message.edit_text(_launcher_text(), parse_mode=ParseMode.HTML,
+                                          reply_markup=_launcher_kbd())
+            except Exception: pass
+            return
+
+        if action == "catch":
+            await _open_catch_config(q, ctx); return
+
+        if action == "held":
+            # Replace current message with the collection summary, then
+            # cards post as separate messages from cmd_held's send loop.
+            if not HOLDS:
+                try: await q.message.edit_text(
+                    "📦 nothing held. Tap 🎟️ New catch → 📦 HOLD mode.",
+                    reply_markup=kbd([[("↩ Back", "top:back")]]))
+                except Exception: pass
+                return
+            # Reuse cmd_held's rendering: edit the launcher to a header, then
+            # fire the cards as new messages below.
+            try:
+                rows = sorted(HOLDS.values(),
+                              key=lambda r: r.started_at or dt.datetime.min, reverse=True)
+                await q.message.edit_text(
+                    f"📦 <b>Your collection</b> · {len(rows)} slot(s)",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kbd([[("↩ Back", "top:back")]]))
+                for rs in rows:
+                    await ctx.bot.send_message(
+                        chat_id=AUTHORIZED_CHAT, text=_hold_card(rs),
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                        reply_markup=_hold_buttons(rs.hold_id, rs.kind))
+            except Exception as exc:
+                log.debug("top:held failed: %s", exc)
+            return
+
+        if action == "buyer":
+            b = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
+            try:
+                await q.message.edit_text(
+                    _buyer_form_text(b), parse_mode=ParseMode.HTML,
+                    reply_markup=_buyer_form_render(b, "top"))
+            except Exception as exc:
+                log.debug("top:buyer failed: %s", exc)
+            return
+
+        if action == "status":
+            # Compact status card right inside the launcher message.
+            running = [rs for rs in HOLDS.values()
+                       if rs.proc and rs.proc.returncode is None]
+            if not running:
+                body = "💤 no runs in flight."
+            else:
+                lines = ["<b>🏃 Running:</b>"]
+                for rs in running:
+                    el = ""
+                    if rs.started_at:
+                        el = f" · {(dt.datetime.utcnow() - rs.started_at).total_seconds():.0f}s"
+                    lines.append(f"  • <code>{rs.hold_id}</code> "
+                                 f"{rs.kind}{el} · {rs.args_summary}")
+                body = "\n".join(lines)
+            try:
+                await q.message.edit_text(body, parse_mode=ParseMode.HTML,
+                                          reply_markup=kbd([[("↩ Back", "top:back")]]))
+            except Exception: pass
+            return
+
+        if action == "help":
+            txt = ("<b>❓ Quick reference</b>\n\n"
+                   "🎟️ <b>New catch</b> — pick date/time/tickets, then HOLD "
+                   "(keep for days, no captcha) or PAY NOW (1 captcha, instant).\n\n"
+                   "📦 <b>My holds</b> — your collection with 💳 Pay + 🛑 Release "
+                   "buttons per slot.\n\n"
+                   "👤 <b>Buyer</b> — tap-each-field form. REQUIRED before 💳 Pay.\n\n"
+                   "📊 <b>Status</b> — which catches are in flight right now.\n\n"
+                   "<i>Direct commands (text):</i> /menu /held /buyer /pay &lt;id&gt; "
+                   "/release &lt;id&gt; /status /logs /last /cancel /resetbuyer")
+            try:
+                await q.message.edit_text(txt, parse_mode=ParseMode.HTML,
+                                          reply_markup=kbd([[("↩ Back", "top:back")]]))
+            except Exception: pass
+            return
+
+        return
+
     # ---------- /buyer form buttons ----------
     if parts[0] == "b":
         action = parts[1] if len(parts) > 1 else ""
 
         if action == "close":
-            try: await q.message.edit_text("✅ buyer saved.")
-            except Exception: pass
+            # "✅ Done" from the launcher-opened form — go back to top-level
+            # menu so the mate stays in the drill-down flow instead of
+            # landing on a dead screen.
+            try:
+                await q.message.edit_text(_launcher_text(),
+                                          parse_mode=ParseMode.HTML,
+                                          reply_markup=_launcher_kbd())
+            except Exception:
+                try: await q.message.edit_text("✅ buyer saved.")
+                except Exception: pass
             return
 
         if action == "set":
