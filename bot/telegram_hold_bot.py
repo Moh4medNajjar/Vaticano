@@ -1356,6 +1356,18 @@ async def _spawn_api_hold_from_menu(ctx: ContextTypes.DEFAULT_TYPE,
         await _send(ctx, "⚠️ Another non-hold run is in flight. /cancel first.")
         return
 
+    # LIVE mode sends buyer fields to Vatican — refuse if any required field
+    # is blank (otherwise argparse would accept the placeholder fallbacks below
+    # and a fake "Guest Visitor" would end up on the PDF).
+    if mode == "live":
+        missing = _buyer_missing(sel)
+        if missing:
+            await _send(ctx,
+                        f"❌ Buyer is incomplete — missing: <b>{', '.join(missing)}</b>.\n"
+                        "Open /buyer to fill them in before firing a PAY NOW catch.",
+                        parse=ParseMode.HTML)
+            return
+
     cmd = [sys.executable, "api_hold.py",
            "--date",             sel.date,
            "--num",              str(sel.num),
@@ -1368,14 +1380,21 @@ async def _spawn_api_hold_from_menu(ctx: ContextTypes.DEFAULT_TYPE,
            "--full",             str(sel.full),
            "--reduced",          str(sel.reduced),
            "--audio",            str(sel.audio),
-           "--first",            sel.first,
-           "--last",             sel.last,
-           "--email",            sel.email,
-           "--phone",            sel.phone,
-           "--country",          sel.country,
-           "--city",             sel.city,
-           "--gender",           sel.gender,
-           "--birth",            sel.birth]
+           # Buyer args — api_hold.py's argparse validates --gender ∈ {M,F} and
+           # the catch build_reservation_config fills representativeUser from
+           # these. For HOLD mode nothing is sent to Vatican (only /recap body,
+           # which has no buyer), so empty/default placeholders are harmless.
+           # For LIVE mode the catch IS sent — _do_pay already blocks that path
+           # when the buyer form is incomplete, so these fallbacks never ship
+           # fake data to Vatican.
+           "--first",            sel.first   or "Guest",
+           "--last",             sel.last    or "Visitor",
+           "--email",            sel.email   or "guest@example.com",
+           "--phone",            sel.phone   or "0000000000",
+           "--country",          sel.country or "Italy",
+           "--city",             sel.city    or "Roma",
+           "--gender",           sel.gender  or "M",
+           "--birth",            sel.birth   or "1990-01-01"]
     if sel.time:
         cmd += ["--time", sel.time]
     if sel.names:

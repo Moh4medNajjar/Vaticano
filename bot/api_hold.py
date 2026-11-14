@@ -417,6 +417,303 @@ async def post_recap(f5: F5Session, cfg: dict) -> dict:
     return j
 
 
+async def _light_keepalive_loop(f5: F5Session, recap: dict,
+                                duration_min: int, interval_sec: int) -> dict:
+    """CARCERE-TRICK TEST: do nothing but lightweight GET /api/visit/recap every
+    interval_sec seconds. Does *not* call /recap POST or any other write — this
+    tests whether reading alone is enough to refresh Vatican's server-side
+    15-min TTL (which is what the omniavaticanrome sniper proved for their
+    site: two carts survived 77 and 71 min on reads alone).
+
+    The GET goes through the SAME Playwright context that caught the hold, so
+    JSESSIONID + TSPD cookies stay warm. If the slot survives past ~18 min
+    on GETs alone, the trick ports and we re-architect HOLD mode at ~150×
+    cheaper Evomi.
+    """
+    import asyncio as _asyncio
+    import time as _time
+
+    reservation_id = (recap or {}).get("reservationId", "")
+    recap_id       = (recap or {}).get("recapId", "")
+    if not reservation_id:
+        return {"error": "no reservationId in recap — nothing to keep alive"}
+
+    started  = _time.monotonic()
+    deadline = started + duration_min * 60
+    cycle    = 0
+    pings: list[dict] = []
+
+    log.info("💡 CARCERE TEST started · initial reservationId=%s recapId=%s",
+             reservation_id, recap_id)
+    log.info("💡 plan: GET /api/visit/recap every %ds for %d min "
+             "(past the 15-min TTL)", interval_sec, duration_min)
+
+    # Rotate between a handful of lightweight session-authenticated GETs the
+    # SPA itself polls on every page view. If Vatican's Spring session TTL
+    # resets on ANY call (standard servlet behaviour), these are enough to
+    # keep the hold alive at essentially zero cost. /visit/recap wants a
+    # full params set we don't have; /config/* always works post-F5.
+    PING_ENDPOINTS = [
+        ("/api/config/isAgency",   {}),
+        ("/api/config/startup",    {"lang": DEFAULT_LANG}),
+        ("/api/search/filter",     {"lang": DEFAULT_LANG, "areaId": DEFAULT_AREA}),
+    ]
+    import itertools as _it
+    pinger = _it.cycle(PING_ENDPOINTS)
+
+    while _time.monotonic() < deadline:
+        cycle += 1
+        elapsed = int(_time.monotonic() - started)
+        path, params = next(pinger)
+        beat: dict = {"cycle": cycle, "t_sec": elapsed, "endpoint": path,
+                      "when": datetime.utcnow().isoformat() + "Z"}
+        try:
+            j = await api_get_json(f5, path, params, retries=1)
+            beat["status"]    = "ok"
+            beat["body_keys"] = sorted(list(j.keys()))[:5] if isinstance(j, dict) else []
+            log.info("💡 cycle=%d t=%ds GET %s OK", cycle, elapsed, path)
+        except F5Rejected:
+            beat["status"] = "f5_rejected"
+            log.warning("💡 cycle=%d t=%ds F5 REJECTED — session downgraded",
+                        cycle, elapsed)
+        except Exception as exc:
+            err = str(exc)[:220]
+            beat["status"] = "error"; beat["msg"] = err
+            low = err.lower()
+            # Vatican tends to return 500 when the reservationId is gone (not
+            # always 404). Flag those as expiry evidence either way.
+            looks_expired = ("404" in err or "410" in err or "not found" in low
+                             or "expired" in low or "no such" in low
+                             or "500" in err)
+            log.warning("💡 cycle=%d t=%ds ERROR: %s", cycle, elapsed, err)
+            pings.append(beat)
+            if looks_expired:
+                log.error("💔 reservation looks EXPIRED at cycle=%d t=%ds — "
+                          "trick did NOT survive", cycle, elapsed)
+                return {"result": "expired", "cycle": cycle, "elapsed_s": elapsed,
+                        "duration_min": duration_min, "interval_sec": interval_sec,
+                        "pings": pings}
+            # Non-fatal, keep going
+            try: await _asyncio.sleep(interval_sec)
+            except _asyncio.CancelledError: break
+            continue
+        pings.append(beat)
+        try:
+            await _asyncio.sleep(interval_sec)
+        except _asyncio.CancelledError:
+            break
+
+    log.info("💡 CARCERE TEST — %d min of GETs done (cycles=%d). Final probe…",
+             duration_min, cycle)
+    # Final probe: do nothing fancy, just report whether the pings stayed
+    # successful. The real survivorship signal is the pattern of the pings
+    # above — if they all succeeded past the 15-min mark, the session TTL
+    # is being refreshed by reads and the slot is held.
+    ok_pings = sum(1 for p in pings if p.get("status") == "ok")
+    err_pings = len(pings) - ok_pings
+    verdict = ("session refreshed by reads — TRICK WORKS"
+               if ok_pings > 0 and err_pings == 0 else
+               "mixed — see per-ping log for pattern")
+    log.info("💡 verdict: %s  (ok=%d errored=%d)", verdict, ok_pings, err_pings)
+    return {"result": "survived", "duration_min": duration_min,
+            "interval_sec": interval_sec, "cycles": cycle,
+            "verdict": verdict, "ok_pings": ok_pings, "err_pings": err_pings,
+            "pings": pings}
+
+
+async def _hybrid_light_rotating(args, out: dict) -> dict:
+    """HYBRID: carcere-style cheap GETs most of the time + rotate F5 session
+    when F5 downgrades. Between rotations, do ONE /recap POST to lock the slot
+    under the fresh session (slot stays — Vatican swaps reservationId atomically).
+
+    Why: pure-GET keepalive dies at F5's ~10-request downgrade. Pure POST-recap
+    rotation works but eats ~240 MB/day/slot. The hybrid keeps the SAME F5
+    session for ~N cheap GETs (each one refreshes Vatican's HttpSession TTL at
+    tiny cost), then rotates once per POST — about 2× fewer F5 solves than the
+    pure rotating-recap approach.
+
+    Shape (per iteration):
+      1. Fresh F5 session on a new Evomi IP.
+      2. POST /recap → fresh reservationId, slot locked (or stays locked).
+      3. Loop N cheap GETs at `--light-interval-sec` pacing. Each one ticks
+         Vatican's session TTL AND is session-authed (cookies warm).
+      4. On F5 reject OR when N cycles reached, close session and loop back.
+
+    Measures per-cycle: endpoint, status, elapsed. Final report tells you how
+    many GETs per F5 solve we averaged (the cost-reduction knob).
+    """
+    import asyncio as _asyncio
+    import random as _random
+    import time as _time
+    import itertools as _it
+
+    max_total_cycles = int(getattr(args, "rerecap_cycles", 0) or 0)   # 0 = forever
+    max_duration_min = int(getattr(args, "hybrid_duration_min", 0) or 0)
+    gets_per_session = max(2, int(getattr(args, "hybrid_gets_per_session", 8) or 8))
+    interval_sec     = max(10, int(getattr(args, "light_interval_sec", 60) or 60))
+
+    PING_ENDPOINTS = [
+        ("/api/config/isAgency",   {}),
+        ("/api/config/startup",    {"lang": DEFAULT_LANG}),
+        ("/api/search/filter",     {"lang": DEFAULT_LANG, "areaId": DEFAULT_AREA}),
+    ]
+
+    slot_info = out.get("slot") or {}
+    if not slot_info:
+        return {"error": "no slot in out"}
+    slot = Slot(**{k: slot_info[k] for k in ("visit_type_id","visit_type_name",
+                                              "visit_id","visit_date","visit_time",
+                                              "availability")})
+    cfg = build_reservation_config(slot, args)
+
+    pool_all = [] if args.no_proxy else load_proxy_pool()
+    used_proxies: list[str] = []
+    pinned_file = pathlib.Path(__file__).resolve().parent.parent / ".pw_profiles" / "pinned_proxy.txt"
+    if pinned_file.exists():
+        try:
+            pinned = pinned_file.read_text(encoding="utf-8").strip()
+            if pinned: used_proxies.append(pinned)
+        except Exception: pass
+    cfg_session = Config(target_date=args.date, num_tickets=args.num,
+                         headless=args.headless, yescaptcha_key=args.yescaptcha_key)
+
+    reports_dir = pathlib.Path(__file__).resolve().parent.parent / "reports"
+    reports_dir.mkdir(exist_ok=True)
+    snapshot_path = reports_dir / f"hold_{int(time.time())}_hybrid_live.json"
+
+    result = {
+        "mode": "hybrid_light_rotating",
+        "started_utc": datetime.utcnow().isoformat() + "Z",
+        "gets_per_session_target": gets_per_session,
+        "interval_sec": interval_sec,
+        "max_total_cycles": max_total_cycles,
+        "max_duration_min": max_duration_min,
+        "slot": slot_info,
+        "sessions": [],   # one entry per F5 session, with its cycle trail
+        "stopped_reason": "unknown",
+    }
+
+    def _save_snapshot():
+        try:
+            snap = dict(out); snap["hybrid_rotating"] = result
+            snapshot_path.write_text(json.dumps(snap, indent=2, default=str),
+                                     encoding="utf-8")
+        except Exception as exc:
+            log.warning("snapshot write failed: %s", exc)
+
+    def _pick_proxy() -> list[str]:
+        if args.proxy: return [args.proxy]
+        if not pool_all: return []
+        remaining = [p for p in pool_all if p not in used_proxies]
+        pick = _random.choice(remaining or pool_all)
+        used_proxies.append(pick)
+        return [pick]
+
+    log.info("🧪 HYBRID: cheap GETs every %ds, rotate F5 after %d gets-per-session, "
+             "duration cap=%s min, total cycles cap=%s",
+             interval_sec, gets_per_session,
+             max_duration_min or "∞", max_total_cycles or "∞")
+    _save_snapshot()
+
+    overall_started = _time.monotonic()
+    total_cycles = 0
+    pinger = _it.cycle(PING_ENDPOINTS)
+
+    while True:
+        if max_total_cycles and total_cycles >= max_total_cycles:
+            result["stopped_reason"] = "max_total_cycles"; break
+        if max_duration_min and (_time.monotonic() - overall_started) >= max_duration_min * 60:
+            result["stopped_reason"] = "max_duration"; break
+
+        chosen = _pick_proxy()
+        proxy_mgr = ProxyManager(chosen, 1)
+        sanitized = (chosen[0].split("@",1)[-1] if chosen and "@" in chosen[0]
+                     else (chosen[0] if chosen else "direct"))
+        sess_entry = {"session_n": len(result["sessions"]) + 1,
+                      "proxy": sanitized, "started_utc": datetime.utcnow().isoformat() + "Z",
+                      "gets": [], "recap": None}
+        result["sessions"].append(sess_entry)
+
+        try:
+            async with F5Session(cfg_session, proxy_mgr) as f5:
+                log.info("🧪 session %d boot  proxy=%s", sess_entry["session_n"], sanitized)
+                try: await f5.solve()
+                except Exception as exc:
+                    log.warning("🧪 F5 solve failed: %s — rotating", exc)
+                    sess_entry["f5_failed"] = str(exc)[:200]; _save_snapshot(); continue
+                if not getattr(f5, "challenge_passed", False):
+                    log.warning("🧪 F5 cold — rotating")
+                    sess_entry["f5_failed"] = "cold"; _save_snapshot(); continue
+                # One canary to confirm /api/* works
+                try:
+                    await api_get_json(f5, "/api/search/filter",
+                                       {"lang": DEFAULT_LANG, "areaId": DEFAULT_AREA},
+                                       retries=1)
+                except F5Rejected:
+                    log.warning("🧪 canary F5-rejected post-solve — rotating")
+                    sess_entry["f5_failed"] = "canary_rejected"; _save_snapshot(); continue
+
+                # POST /recap to (re)lock the slot under THIS session
+                try:
+                    r = await post_recap(f5, cfg)
+                    sess_entry["recap"] = {"reservationId": r.get("reservationId"),
+                                           "recapId":       r.get("recapId"),
+                                           "total":         r.get("total")}
+                    log.info("🧪 /recap under session %d: res=%s",
+                             sess_entry["session_n"], r.get("reservationId"))
+                except Exception as exc:
+                    log.warning("🧪 /recap failed under session %d: %s — rotating",
+                                sess_entry["session_n"], exc)
+                    sess_entry["recap_failed"] = str(exc)[:200]
+                    _save_snapshot(); continue
+
+                # Now do N cheap GETs
+                for i in range(gets_per_session):
+                    if max_total_cycles and total_cycles >= max_total_cycles: break
+                    if max_duration_min and (_time.monotonic() - overall_started) >= max_duration_min * 60: break
+                    try:
+                        await _asyncio.sleep(interval_sec + _random.uniform(-3, 3))
+                    except _asyncio.CancelledError:
+                        result["stopped_reason"] = "cancelled"
+                        _save_snapshot(); return result
+
+                    total_cycles += 1
+                    path, params = next(pinger)
+                    elapsed_overall = int(_time.monotonic() - overall_started)
+                    gbeat = {"get_n": i+1, "endpoint": path, "t_overall_s": elapsed_overall}
+                    try:
+                        await api_get_json(f5, path, params, retries=1)
+                        gbeat["status"] = "ok"
+                        log.info("🧪 sess %d get %d/%d t=%ds %s OK",
+                                 sess_entry["session_n"], i+1, gets_per_session,
+                                 elapsed_overall, path)
+                    except F5Rejected:
+                        gbeat["status"] = "f5_rejected"
+                        log.warning("🧪 sess %d get %d F5-REJECTED at t=%ds — rotating",
+                                    sess_entry["session_n"], i+1, elapsed_overall)
+                        sess_entry["gets"].append(gbeat); _save_snapshot()
+                        break
+                    except Exception as exc:
+                        gbeat["status"] = "err"; gbeat["msg"] = str(exc)[:160]
+                        log.warning("🧪 sess %d get %d ERR: %s",
+                                    sess_entry["session_n"], i+1, exc)
+                    sess_entry["gets"].append(gbeat); _save_snapshot()
+        except Exception as exc:
+            sess_entry["bootstrap_failed"] = str(exc)[:200]
+            log.warning("🧪 session %d bootstrap exc: %s", sess_entry["session_n"], exc)
+
+    # Final report
+    total_gets  = sum(len(s.get("gets", [])) for s in result["sessions"])
+    total_f5    = sum(1 for s in result["sessions"] if s.get("recap"))
+    result["total_gets"]  = total_gets
+    result["total_f5"]    = total_f5
+    result["gets_per_f5"] = (total_gets / total_f5) if total_f5 else 0
+    log.info("🧪 HYBRID done  reason=%s  F5 solves=%d  GETs=%d  gets_per_F5=%.1f",
+             result["stopped_reason"], total_f5, total_gets, result["gets_per_f5"])
+    _save_snapshot()
+    return result
+
+
 async def _rotating_rerecap(args, out: dict) -> dict:
     """Perpetual low-cost hold: re-POST /recap every `--rerecap-min` minutes on a
     FRESH F5Session (new Evomi IP + new Chrome profile) every N cycles.
@@ -1175,6 +1472,20 @@ async def main_async(args) -> dict:
                         log.info("💾 recap snapshot: %s", early.name)
                     except Exception as exc:
                         log.warning("snapshot write failed: %s", exc)
+                    # CARCERE-TRICK TEST: lightweight GET keepalive runs INSIDE
+                    # this same session so JSESSIONID + TSPD cookies stay
+                    # warm. No POSTs, no captcha. See _light_keepalive_loop.
+                    if getattr(args, "light_keepalive", False):
+                        try:
+                            out["light_keepalive"] = await _light_keepalive_loop(
+                                f5, recap,
+                                duration_min=int(getattr(args, "light_duration_min", 25) or 25),
+                                interval_sec=int(getattr(args, "light_interval_sec", 60) or 60),
+                            )
+                        except Exception as exc:
+                            log.warning("light keepalive crashed: %s", exc)
+                            out["light_keepalive"] = {"error": str(exc)}
+                        return out
                     # The rotating re-recap loop is intentionally run OUTSIDE
                     # this F5Session context (main() launches it after we return)
                     # so it builds its own fresh F5Session per cycle batch —
@@ -1332,6 +1643,31 @@ def parse_args():
     p.add_argument("--rerecap-cycles", type=int, default=0,
                    help="With --rerecap-min, max cycles before exit. 0 = unlimited "
                         "(runs until killed). Useful for finite tests.")
+    p.add_argument("--hybrid-keepalive", action="store_true",
+                   help="HYBRID mode (recommended cheap hold): after /recap, "
+                        "cycle cheap GETs for --hybrid-gets-per-session reads, "
+                        "then rotate F5 session on a fresh Evomi IP. 1 F5 solve "
+                        "amortised across ~8 GETs + 1 POST instead of 3 POSTs. "
+                        "~2× cheaper than rotating-recap, proven safer than "
+                        "pure GET-keepalive (which dies at F5's ~10-read wall).")
+    p.add_argument("--hybrid-gets-per-session", type=int, default=8,
+                   help="With --hybrid-keepalive: max cheap GETs per F5 session "
+                        "before rotating. Default 8 (safely below the ~10 F5 "
+                        "downgrade wall observed in tests).")
+    p.add_argument("--hybrid-duration-min", type=int, default=0,
+                   help="With --hybrid-keepalive: wall-clock cap in minutes "
+                        "(0 = unlimited; runs until --rerecap-cycles or killed).")
+    p.add_argument("--light-keepalive", action="store_true",
+                   help="CARCERE-TRICK TEST: after /recap, keep the same "
+                        "Playwright session alive and do GET /api/visit/recap "
+                        "every --light-interval-sec. Tests whether lightweight "
+                        "reads refresh Vatican's server-side 15-min TTL. "
+                        "Zero captcha spend.")
+    p.add_argument("--light-interval-sec", type=int, default=60,
+                   help="GET cadence for --light-keepalive (default 60 s).")
+    p.add_argument("--light-duration-min", type=int, default=25,
+                   help="How long --light-keepalive runs (default 25 min — "
+                        "enough to prove it passes the 15-min TTL cliff).")
     p.add_argument("--rerecap-sess-cycles", type=int, default=3,
                    help="How many /recap cycles one F5Session handles before "
                         "rotating to a new Evomi IP + fresh Chrome profile. "
@@ -1377,6 +1713,14 @@ if __name__ == "__main__":
     # Separate because each cycle needs a fresh Evomi IP + fresh Chrome profile
     # (F5 downgrades a session after ~4 POSTs). No captcha spent here.
     if (getattr(args, "hold_only", False)
+            and getattr(args, "hybrid_keepalive", False)
+            and out.get("result") == "held_recap_only"):
+        log.info("🚀 handing off to HYBRID light+rotate loop")
+        try:
+            asyncio.run(_hybrid_light_rotating(args, out))
+        except KeyboardInterrupt:
+            log.info("🛑 hybrid stopped by Ctrl-C")
+    elif (getattr(args, "hold_only", False)
             and int(getattr(args, "rerecap_min", 0) or 0) > 0
             and out.get("result") == "held_recap_only"):
         log.info("🚀 handing off to rotating rerecap loop (fresh IP each burst)")
