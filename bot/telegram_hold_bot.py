@@ -249,7 +249,8 @@ class MenuSel:
     mode:   str = "hold"       # "hold" (no captcha, keep for days) | "live" (pay now) | "dry"
     keepalive: bool = True     # hold past the 5-min countdown (live mode only)
     keepalive_min: int = 20    # minutes of keepalive (live mode only)
-    rerecap_min:  int = 2      # /recap refresh interval in minutes (hold mode)
+    rerecap_min:  int = 9      # /recap refresh in minutes — 6-min safety margin
+                               # before Vatican's ~15-min TTL cliff.
     rerecap_sess: int = 3      # /recap cycles per proxy before rotating (hold mode)
     # Buyer — ALL empty by default. Your mate fills them in via the /buyer form
     # before tapping 💳 Pay. If any required field is empty when payment is
@@ -2011,9 +2012,15 @@ async def _spawn_api_hold_from_menu(ctx: ContextTypes.DEFAULT_TYPE,
            "--gender",           sel.gender  or "M",
            "--birth",            sel.birth   or "1990-01-01"]
     if sel.time:
-        cmd += ["--time", sel.time]
+        # Strict time filter so the mate's picked time is honoured, not ignored
+        # by find_slot's old prefer_time_hhmm bias.
+        cmd += ["--time", sel.time, "--strict-time"]
     if sel.names:
         cmd += ["--participants", sel.names]
+    if mode == "hold":
+        # HOLD must have spare seats to swap sessions; LOW_AVAILABILITY slots
+        # break the rotating /recap loop (Vatican 500 "no tickets to swap").
+        cmd.append("--no-low-availability")
 
     if mode == "hold":
         # LOW-COST perpetual hold: just /recap, no Turnstile, no money.

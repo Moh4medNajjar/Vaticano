@@ -241,7 +241,9 @@ def to_dmy(iso_date: str) -> str:
 
 
 async def find_slot(f5: F5Session, start_iso: str, days_ahead: int,
-                    visitors: int, prefer_time_hhmm: Optional[str] = None) -> Slot:
+                    visitors: int, prefer_time_hhmm: Optional[str] = None,
+                    strict_time: bool = False,
+                    allow_low_availability: bool = True) -> Slot:
     """Walk filter → calendar → resultPerTag → timeavail. Mirrors the real SPA.
 
     Switched from /api/search/result?area=1&who=1&lang=en to
@@ -273,10 +275,12 @@ async def find_slot(f5: F5Session, start_iso: str, days_ahead: int,
             "area": DEFAULT_AREA, "who": DEFAULT_WHO, "page": 0,
             "tag": "MV-Biglietti",
         })
+        _visit_avail = ("AVAILABLE", "LOW_AVAILABILITY") if allow_low_availability \
+                       else ("AVAILABLE",)
         matches = [v for v in res.get("visits", [])
                    if all(k.lower() in (v.get("name","") or "").lower()
                           for k in VISIT_NAME_REQUIRED)
-                   and v.get("availability") in ("AVAILABLE", "LOW_AVAILABILITY")]
+                   and v.get("availability") in _visit_avail]
         if not matches:
             names = [(v.get("name",""), v.get("availability","?"))
                      for v in res.get("visits", [])][:3]
@@ -293,10 +297,15 @@ async def find_slot(f5: F5Session, start_iso: str, days_ahead: int,
             "visitorNum": visitors, "visitDate": date_dmy,
         })
         timetable = times.get("timetable", [])
+        _time_avail = ("AVAILABLE", "LOW_AVAILABILITY") if allow_low_availability \
+                      else ("AVAILABLE",)
         ranked: list[tuple[int, dict]] = []
         for t in timetable:
             av = (t.get("availability") or "").upper()
-            if av not in ("AVAILABLE", "LOW_AVAILABILITY"):
+            if av not in _time_avail:
+                continue
+            # strict_time: drop entries that don't match the time filter at all.
+            if strict_time and prefer_time_hhmm and not t.get("time", "").startswith(prefer_time_hhmm):
                 continue
             rank = 0 if av == "AVAILABLE" else 1
             if prefer_time_hhmm and t.get("time", "").startswith(prefer_time_hhmm):
@@ -305,7 +314,8 @@ async def find_slot(f5: F5Session, start_iso: str, days_ahead: int,
         ranked.sort(key=lambda x: x[0])
         if not ranked:
             sample = [(t.get("time"), t.get("availability")) for t in timetable[:10]]
-            log.info("[%s] no bookable slots. sample: %s", date_dmy, sample)
+            log.info("[%s] no bookable slots (strict_time=%s, allow_low=%s). sample: %s",
+                     date_dmy, strict_time, allow_low_availability, sample)
             continue
         best = ranked[0][1]
         return Slot(
@@ -1410,7 +1420,9 @@ async def main_async(args) -> dict:
 
                 log.info("--- slot discovery ---")
                 slot = await find_slot(f5, args.date, args.days_ahead, args.num,
-                                       prefer_time_hhmm=args.time)
+                                       prefer_time_hhmm=args.time,
+                                       strict_time=getattr(args, "strict_time", False),
+                                       allow_low_availability=getattr(args, "allow_low_availability", True))
                 out["slot"] = asdict(slot)
                 log.info("slot picked: %s", slot)
 
@@ -1578,7 +1590,20 @@ def parse_args():
     p.add_argument("--date",  default=default_date, help="Start date YYYY-MM-DD")
     p.add_argument("--days-ahead", type=int, default=45,
                    help="Max days forward to search if start date has nothing")
-    p.add_argument("--time",  default=None, help="Preferred HH:MM (loose match)")
+    p.add_argument("--time",  default=None,
+                   help="Time filter: HH or HH:MM. Loose match by default "
+                        "(bot falls back to any available time if nothing fits); "
+                        "pass --strict-time to force an exact prefix match.")
+    p.add_argument("--strict-time", action="store_true",
+                   help="With --time: refuse any slot whose time doesn't "
+                        "start with that HH/HH:MM prefix. No fallback.")
+    p.add_argument("--no-low-availability", dest="allow_low_availability",
+                   action="store_false", default=True,
+                   help="Skip LOW_AVAILABILITY slots — only take AVAILABLE "
+                        "ones. Default for HOLD mode because LOW slots fail "
+                        "rotating re-recap with Vatican's 'no tickets to swap' "
+                        "500. For LIVE/one-shot pay, LOW is fine (leave this "
+                        "flag off).")
     p.add_argument("--num",   type=int, default=2, help="Number of visitors")
     p.add_argument("--first", default="Mohamed")
     p.add_argument("--last",  default="Najjar")
