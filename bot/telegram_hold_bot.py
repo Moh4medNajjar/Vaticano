@@ -1057,15 +1057,159 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _render_main_menu(ctx)
 
 
+# ── 4-step hunt wizard (matches sniper.js's step-by-step card flow) ────
+# Each step edits the SAME message (tgEdit pattern). The MenuSel state
+# collects date/time/tickets/mode across steps.
+
+def _hunt_date_kbd(center_iso: str) -> InlineKeyboardMarkup:
+    """Date picker: 8 days around `center` (2 rows × 4) + prev/next/back."""
+    base = dt.date.fromisoformat(center_iso)
+    days = [base + dt.timedelta(days=i) for i in range(-1, 7)]
+    r1 = [(d.strftime("%a %d/%m"), f"hunt:date:set:{d.isoformat()}") for d in days[:4]]
+    r2 = [(d.strftime("%a %d/%m"), f"hunt:date:set:{d.isoformat()}") for d in days[4:]]
+    prev7 = (base - dt.timedelta(days=7)).isoformat()
+    next7 = (base + dt.timedelta(days=7)).isoformat()
+    return kbd([
+        r1, r2,
+        [("⏪ -7d", f"hunt:date:nav:{prev7}"),
+         ("⏩ +7d", f"hunt:date:nav:{next7}")],
+        [("↩ Back", "main")],
+    ])
+
+
+def _hunt_step1_date(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
+    center = sel.date or _menu_default_date()
+    txt = ("🎫 <b>New hunt · Step 1 of 4: Date</b>\n\n"
+           f"Showing days around <code>{center}</code>.")
+    return txt, _hunt_date_kbd(center)
+
+
+_TIMES_PICKER = [
+    ("any time",       ""),
+    ("morning (09)",   "09"),
+    ("mid-day (12)",   "12"),
+    ("afternoon (14)", "14"),
+    ("late (16)",      "16"),
+    ("evening (17)",   "17"),
+]
+
+
+def _hunt_step2_time(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
+    rows = []
+    for label, val in _TIMES_PICKER:
+        tag = "● " if sel.time == val else "○ "
+        rows.append([(tag + label, f"hunt:time:set:{val or 'any'}")])
+    rows.append([("↩ Back (date)", "hunt:back:1")])
+    txt = ("🎫 <b>New hunt · Step 2 of 4: Time</b>\n\n"
+           f"📅 Date: <code>{sel.date}</code>\n"
+           "Pick a time (bot still falls back to any available slot in that window):")
+    return txt, kbd(rows)
+
+
+# Preset ticket mixes keyed to common Vatican admission combos.
+_TIX_PRESETS = [
+    ("1 reduced",         (0, 1, 0)),
+    ("1 full",            (1, 0, 0)),
+    ("2 full",            (2, 0, 0)),
+    ("2 full + 1 reduced",(2, 1, 0)),
+    ("2 full + 1 red + 1 audio", (2, 1, 1)),
+    ("Custom (± buttons)", None),
+]
+
+
+def _hunt_step3_tix(sel: MenuSel, custom: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    time_label = next((lbl for lbl, v in _TIMES_PICKER if v == sel.time), "any")
+    header = (f"🎫 <b>New hunt · Step 3 of 4: Tickets</b>\n\n"
+              f"📅 Date: <code>{sel.date}</code>\n"
+              f"🕐 Time: <code>{time_label}</code>\n\n")
+    if not custom:
+        rows = []
+        for label, triple in _TIX_PRESETS:
+            if triple is None:
+                rows.append([(label, "hunt:tix:custom")])
+            else:
+                tag = "● " if (sel.full, sel.reduced, sel.audio) == triple else "○ "
+                rows.append([(tag + label, f"hunt:tix:preset:{triple[0]}:{triple[1]}:{triple[2]}")])
+        rows.append([("↩ Back (time)", "hunt:back:2")])
+        return header + "Pick a preset or Custom:", kbd(rows)
+    # Custom: +/- buttons
+    rows = [
+        [("🎫 Full €20",     "noop"),
+         ("➖",               "hunt:cust:full:dec"),
+         (str(sel.full),     "noop"),
+         ("➕",               "hunt:cust:full:inc")],
+        [("🎫 Reduced €10",  "noop"),
+         ("➖",               "hunt:cust:red:dec"),
+         (str(sel.reduced),  "noop"),
+         ("➕",               "hunt:cust:red:inc")],
+        [("🎧 Audioguide €8", "noop"),
+         ("➖",                "hunt:cust:audio:dec"),
+         (str(sel.audio),     "noop"),
+         ("➕",                "hunt:cust:audio:inc")],
+        [("✅ Done — next (mode)", "hunt:tix:done")],
+        [("↩ Back (presets)",    "hunt:back:3preset")],
+    ]
+    total = 20*sel.full + 10*sel.reduced + 5*(sel.full+sel.reduced) + 8*sel.audio
+    body = header + (f"Custom — tap ± to adjust.\n\n"
+                     f"👥 Visitors: <b>{sel.num}</b>\n"
+                     f"💶 Estimated: <b>€{total:.2f}</b>")
+    return body, kbd(rows)
+
+
+def _hunt_step4_mode(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
+    time_label = next((lbl for lbl, v in _TIMES_PICKER if v == sel.time), "any")
+    total = 20*sel.full + 10*sel.reduced + 5*sel.num + 8*sel.audio
+    txt = ("🎫 <b>New hunt · Step 4 of 4: Mode</b>\n\n"
+           f"📅 {sel.date}  🕐 {time_label}\n"
+           f"🎫 {sel.full}f + {sel.reduced}r"
+           + (f" + {sel.audio}a" if sel.audio else "")
+           + f"  ·  <b>€{total:.2f}</b>\n\n"
+           "Pick the mode:")
+    rows = [
+        [("📦 HOLD — no captcha, keep for days", "hunt:mode:hold")],
+        [("💳 PAY NOW — 1 captcha, instant",     "hunt:mode:live")],
+        [("↩ Back (tickets)",                     "hunt:back:3")],
+    ]
+    return txt, kbd(rows)
+
+
+def _hunt_confirm(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
+    time_label = next((lbl for lbl, v in _TIMES_PICKER if v == sel.time), "any")
+    total = 20*sel.full + 10*sel.reduced + 5*sel.num + 8*sel.audio
+    mode_tag = {"hold": "📦 HOLD (no captcha)",
+                "live": "💳 PAY NOW (1 captcha)",
+                "dry":  "🧪 DRY"}.get(sel.mode, sel.mode)
+    missing = _buyer_missing(sel) if sel.mode == "live" else []
+    body = ("🎫 <b>Confirm hunt</b>\n\n"
+            f"📅 {sel.date}  🕐 {time_label}\n"
+            f"🎯 Admission Ticket\n"
+            f"🎫 {sel.full}f + {sel.reduced}r"
+            + (f" + {sel.audio}a" if sel.audio else "")
+            + f"  ·  👥 {sel.num}  ·  <b>€{total:.2f}</b>\n"
+            f"🔧 {mode_tag}")
+    if missing:
+        body += ("\n\n⚠️ <b>Buyer incomplete</b> — PAY NOW will refuse until "
+                 f"you set: {', '.join(missing)}. Tap below to open the form.")
+        rows = [
+            [("👤 Fix buyer first", "buyer_open")],
+            [("↩ Back (mode)",    "hunt:back:4")],
+        ]
+    else:
+        rows = [
+            [("✅ CATCH!",          "hunt:fire"),
+             ("↩ Back (mode)",    "hunt:back:4")],
+        ]
+    return body, kbd(rows)
+
+
 async def _open_catch_config(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Replaces the message with the catch-config screen (date/time/tickets/mode).
-    Used by the launcher's 🎟️ New catch button."""
+    """Entry into the 4-step New-hunt wizard."""
     sel = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
     if not sel.date:
         sel.date = _menu_default_date()
+    txt, markup = _hunt_step1_date(sel)
     try:
-        await q.message.edit_text(_menu_text(sel), parse_mode=ParseMode.HTML,
-                                  reply_markup=_menu_render(sel))
+        await q.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=markup)
     except Exception as exc:
         log.debug("open_catch_config failed: %s", exc)
 
@@ -1151,6 +1295,114 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=_buyer_form_render(b, "main"))
         except Exception as exc:
             log.debug("buyer_open failed: %s", exc)
+        return
+
+    # ---------- 4-step New-hunt wizard ----------
+    if parts[0] == "hunt":
+        if not sel.date:
+            sel.date = _menu_default_date()
+        action = parts[1] if len(parts) > 1 else ""
+
+        async def render(builder, *args):
+            txt, markup = builder(sel, *args)
+            try:
+                await q.message.edit_text(txt, parse_mode=ParseMode.HTML,
+                                          reply_markup=markup)
+            except Exception as exc:
+                log.debug("hunt render failed: %s", exc)
+
+        # ── Back ────────────────────────────────────────────────────────
+        if action == "back":
+            where = parts[2] if len(parts) > 2 else "1"
+            if where == "1":       await render(_hunt_step1_date); return
+            if where == "2":       await render(_hunt_step2_time); return
+            if where == "3":       await render(_hunt_step3_tix);  return
+            if where == "3preset": await render(_hunt_step3_tix, False); return
+            if where == "4":       await render(_hunt_step4_mode); return
+            return
+
+        # ── Step 1: date ────────────────────────────────────────────────
+        if action == "date":
+            op = parts[2]
+            if op == "nav":
+                center = parts[3]
+                try:
+                    await q.message.edit_text(
+                        f"🎫 <b>New hunt · Step 1 of 4: Date</b>\n\n"
+                        f"Showing days around <code>{center}</code>.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=_hunt_date_kbd(center))
+                except Exception: pass
+                return
+            if op == "set":
+                sel.date = parts[3]
+                _save_menu_state()
+                await render(_hunt_step2_time); return
+
+        # ── Step 2: time ────────────────────────────────────────────────
+        if action == "time":
+            if parts[2] == "set":
+                val = parts[3]
+                sel.time = "" if val == "any" else val
+                _save_menu_state()
+                await render(_hunt_step3_tix); return
+
+        # ── Step 3: tickets ─────────────────────────────────────────────
+        if action == "tix":
+            op = parts[2]
+            if op == "preset":
+                full_, red_, audio_ = int(parts[3]), int(parts[4]), int(parts[5])
+                sel.full, sel.reduced, sel.audio = full_, red_, audio_
+                _save_menu_state()
+                await render(_hunt_step4_mode); return
+            if op == "custom":
+                await render(_hunt_step3_tix, True); return
+            if op == "done":
+                if sel.full + sel.reduced < 1:
+                    try: await q.answer("Pick at least one ticket!", show_alert=True)
+                    except Exception: pass
+                    return
+                if sel.audio > sel.num:
+                    sel.audio = sel.num
+                _save_menu_state()
+                await render(_hunt_step4_mode); return
+
+        if action == "cust":
+            # Custom +/- controls (tix step)
+            kind, op = parts[2], parts[3]
+            if kind == "full":
+                if op == "inc" and sel.full + sel.reduced < 6: sel.full += 1
+                elif op == "dec" and sel.full > 0: sel.full -= 1
+            elif kind == "red":
+                if op == "inc" and sel.full + sel.reduced < 6: sel.reduced += 1
+                elif op == "dec" and sel.reduced > 0: sel.reduced -= 1
+                if sel.full == 0 and sel.reduced == 0: sel.reduced = 1
+            elif kind == "audio":
+                if op == "inc" and sel.audio < sel.num: sel.audio += 1
+                elif op == "dec" and sel.audio > 0: sel.audio -= 1
+            _save_menu_state()
+            await render(_hunt_step3_tix, True); return
+
+        # ── Step 4: mode ────────────────────────────────────────────────
+        if action == "mode":
+            sel.mode = parts[2]
+            _save_menu_state()
+            await render(_hunt_confirm); return
+
+        # ── Fire ────────────────────────────────────────────────────────
+        if action == "fire":
+            try:
+                await q.message.edit_text(
+                    f"🚀 Firing <b>{sel.mode.upper()}</b>\n"
+                    f"📅 {sel.date}  🕐 {sel.time or 'any'}\n"
+                    f"🎫 {sel.full}f + {sel.reduced}r"
+                    + (f" + {sel.audio}a" if sel.audio else ""),
+                    parse_mode=ParseMode.HTML)
+            except Exception: pass
+            _save_menu_state()
+            await _spawn_api_hold_from_menu(ctx, sel)
+            return
+
         return
 
     if data == "help_open":
