@@ -802,29 +802,18 @@ def kbd(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
          for row in rows])
 
 
+# Mirrors underground/bot/botmanager/botmanager.py:cmd_menu — 3x3 grid, terse
+# labels, no walls of text. Your mate carries over the same muscle memory.
 def _launcher_kbd() -> InlineKeyboardMarkup:
-    """Top-level launcher — one tap per task. Matches the botmanager style
-    (short labels, 2-wide rows, no walls of text)."""
     return kbd([
-        [("🎟️ New catch", "top:catch"),  ("📦 My holds",  "top:held")],
-        [("👤 Buyer",      "top:buyer"),  ("📊 Status",    "top:status")],
-        [("❓ Help",        "top:help"),   ("✖ Close",      "top:close")],
+        [("Catch",  "top:catch"),  ("Held",   "top:held"),   ("Pay",   "top:pay")],
+        [("Status", "top:status"), ("Logs",   "top:logs"),   ("Live",  "top:live")],
+        [("Buyer",  "top:buyer"),  ("Slots",  "top:slots"),  ("More",  "top:more")],
     ])
 
 
 def _launcher_text() -> str:
-    held_count = sum(1 for rs in HOLDS.values()
-                     if rs.proc and rs.proc.returncode is None)
-    sel  = MENU.get(AUTHORIZED_CHAT) or MenuSel()
-    missing = _buyer_missing(sel)
-    buyer_badge = ("✅ buyer complete" if not missing
-                   else f"⚠️ buyer incomplete ({len(missing)} missing)")
-    return (
-        "<b>🎟️ Vatican Catch Bot</b>\n"
-        "What do you want to do?\n\n"
-        f"📦 holding: <b>{held_count}</b> slot(s)\n"
-        f"👤 {buyer_badge}"
-    )
+    return "What do you want to do?"
 
 
 @only_our_chat
@@ -868,6 +857,19 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     parts = data.split(":")
 
     if data == "noop":
+        return
+
+    # ---------- carcere-style Refresh/Verbose on /status ----------
+    if parts[0] == "refreshstatus":
+        verbose = len(parts) > 1 and parts[1] == "verbose"
+        try:
+            await q.message.edit_text(
+                _build_status_text(verbose=verbose),
+                parse_mode=ParseMode.HTML,
+                reply_markup=kbd([[("Refresh", "refreshstatus"),
+                                    ("Verbose", "refreshstatus:verbose")]]))
+        except Exception as exc:
+            log.debug("refreshstatus edit failed: %s", exc)
         return
 
     # ---------- top-level launcher ----------
@@ -929,39 +931,109 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         if action == "status":
-            # Compact status card right inside the launcher message.
+            try:
+                await q.message.edit_text(
+                    _build_status_text(verbose=False),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kbd([[("Refresh", "refreshstatus"),
+                                        ("Verbose", "refreshstatus:verbose")],
+                                       [("↩ Back", "top:back")]]))
+            except Exception: pass
+            return
+
+        if action == "pay":
+            # Show each held longhold as a pickable row — tap to open pay confirm.
+            longholds = [rs for rs in HOLDS.values() if rs.kind == "longhold"
+                         and rs.proc and rs.proc.returncode is None]
+            if not longholds:
+                try: await q.message.edit_text(
+                    "📦 nothing to pay. Catch a HOLD first, then come back.",
+                    reply_markup=kbd([[("↩ Back", "top:back")]]))
+                except Exception: pass
+                return
+            rows = []
+            for rs in longholds:
+                s = rs.slot_meta or {}
+                label = f"{rs.hold_id}  {s.get('date','?')} {s.get('time') or 'any'}"
+                rows.append([(label, f"h:pay:{rs.hold_id}")])
+            rows.append([("↩ Back", "top:back")])
+            try:
+                await q.message.edit_text(
+                    "<b>💳 Which hold do you want to pay?</b>\n"
+                    "(this spends 1 captcha + opens the Catholica form)",
+                    parse_mode=ParseMode.HTML, reply_markup=kbd(rows))
+            except Exception: pass
+            return
+
+        if action == "logs":
             running = [rs for rs in HOLDS.values()
                        if rs.proc and rs.proc.returncode is None]
             if not running:
-                body = "💤 no runs in flight."
-            else:
-                lines = ["<b>🏃 Running:</b>"]
-                for rs in running:
-                    el = ""
-                    if rs.started_at:
-                        el = f" · {(dt.datetime.utcnow() - rs.started_at).total_seconds():.0f}s"
-                    lines.append(f"  • <code>{rs.hold_id}</code> "
-                                 f"{rs.kind}{el} · {rs.args_summary}")
-                body = "\n".join(lines)
+                try: await q.message.edit_text(
+                    "no runs — nothing to show.",
+                    reply_markup=kbd([[("↩ Back", "top:back")]]))
+                except Exception: pass
+                return
+            rows = [[(rs.hold_id, f"top:logs1:{rs.hold_id}")] for rs in running]
+            rows.append([("↩ Back", "top:back")])
             try:
-                await q.message.edit_text(body, parse_mode=ParseMode.HTML,
-                                          reply_markup=kbd([[("↩ Back", "top:back")]]))
+                await q.message.edit_text(
+                    "Pick a run to view the last 30 log lines:",
+                    reply_markup=kbd(rows))
+            except Exception: pass
+            return
+
+        if action == "logs1":
+            hid = parts[2] if len(parts) > 2 else ""
+            rs = HOLDS.get(hid)
+            if rs is None or not rs.last_lines:
+                try: await q.message.edit_text(
+                    f"no lines yet for <code>{hid}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kbd([[("↩ Back", "top:logs")]]))
+                except Exception: pass
+                return
+            body = "\n".join(rs.last_lines[-30:])[-3500:]
+            try:
+                await q.message.edit_text(
+                    f"<b>{hid}</b>\n<pre>{_html_escape(body)}</pre>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kbd([[("↩ Back", "top:logs")]]))
+            except Exception: pass
+            return
+
+        if action == "live":
+            try: await q.message.edit_text(
+                "📡 <b>Live stream</b>\n\n"
+                "Use <code>/live &lt;hold_id&gt;</code> — streams any new "
+                "interesting line for 5 min.\n\n"
+                "See /held for hold_ids.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kbd([[("↩ Back", "top:back")]]))
+            except Exception: pass
+            return
+
+        if action == "slots":
+            try: await q.message.edit_text(
+                "🔎 <b>Slot probe</b>\n\n"
+                "Use <code>/slots YYYY-MM-DD</code> to list Admission times "
+                "Vatican currently offers on that date. No captcha.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kbd([[("↩ Back", "top:back")]]))
+            except Exception: pass
+            return
+
+        if action == "more":
+            try: await q.message.edit_text(
+                HELP_TEXT, parse_mode=ParseMode.HTML,
+                reply_markup=kbd([[("↩ Back", "top:back")]]))
             except Exception: pass
             return
 
         if action == "help":
-            txt = ("<b>❓ Quick reference</b>\n\n"
-                   "🎟️ <b>New catch</b> — pick date/time/tickets, then HOLD "
-                   "(keep for days, no captcha) or PAY NOW (1 captcha, instant).\n\n"
-                   "📦 <b>My holds</b> — your collection with 💳 Pay + 🛑 Release "
-                   "buttons per slot.\n\n"
-                   "👤 <b>Buyer</b> — tap-each-field form. REQUIRED before 💳 Pay.\n\n"
-                   "📊 <b>Status</b> — which catches are in flight right now.\n\n"
-                   "<i>Direct commands (text):</i> /menu /held /buyer /pay &lt;id&gt; "
-                   "/release &lt;id&gt; /status /logs /last /cancel /resetbuyer")
-            try:
-                await q.message.edit_text(txt, parse_mode=ParseMode.HTML,
-                                          reply_markup=kbd([[("↩ Back", "top:back")]]))
+            try: await q.message.edit_text(
+                HELP_TEXT, parse_mode=ParseMode.HTML,
+                reply_markup=kbd([[("↩ Back", "top:back")]]))
             except Exception: pass
             return
 
@@ -1436,6 +1508,43 @@ async def _spawn_api_hold_from_menu(ctx: ContextTypes.DEFAULT_TYPE,
 
 
 # --------------------------------------------------------------------- commands
+HELP_TEXT = """<b>Vatican Hold Bot Commands:</b>
+
+/menu — Interactive menu with buttons
+/catch &lt;date&gt; [time] [tickets] [mode] — Catch & hold a slot
+/held — Held slots + Pay/Release buttons
+/pay &lt;hold_id&gt; — Send a held slot to Catholica (1 captcha)
+/stop &lt;hold_id&gt; — Stop holding (alias: /release)
+/status [hold_id] — Hold status + health
+/logs &lt;hold_id&gt; [lines] — View logs (default 30)
+/live &lt;hold_id&gt; — Stream the catch (5 min poll)
+/slots [date] — Vatican availability for a date
+/buyer — Step-by-step buyer form
+/setbuyer first=… last=… email=… — One-shot buyer set
+/setnames First1 Last1, First2 Last2 — Per-visitor names
+/resetbuyer — Wipe buyer data
+
+Modes: hold (no captcha, auto-refresh), live (1 captcha, instant pay)
+
+Ticket syntax in /catch: <code>Nfull</code>, <code>Nreduced</code>, <code>Naudio</code>, combined with <code>+</code>
+  e.g. <code>2full+1reduced+1audio</code> = 3 visitors + 1 audioguide
+
+Examples:
+/catch 2026-12-25 17:00 1reduced hold
+/catch 2026-12-25 any 2full+1reduced live
+/pay h1794696719
+/status
+/held
+/logs h1794696719
+/slots 2026-12-25
+"""
+
+
+@only_our_chat
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send(ctx, HELP_TEXT, parse=ParseMode.HTML)
+
+
 @only_our_chat
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _send(ctx,
@@ -1464,18 +1573,47 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _build_status_text(verbose: bool = False) -> str:
+    """Carcere-style compact table: one line per hold."""
+    running = [rs for rs in HOLDS.values()
+               if rs.proc and rs.proc.returncode is None]
+    dead    = [rs for rs in HOLDS.values()
+               if not (rs.proc and rs.proc.returncode is None)]
+    if not running and not dead:
+        return "💤 no holds. /catch or /menu to start."
+    lines = [f"<b>Holds:</b> {len(running)} running · {len(dead)} dead"]
+    for rs in sorted(running, key=lambda r: r.started_at or dt.datetime.min):
+        s = rs.slot_meta or {}
+        age_s = (dt.datetime.utcnow() - rs.started_at).total_seconds() if rs.started_at else 0
+        age = f"{int(age_s/60)}m{int(age_s%60):02d}s"
+        lines.append(
+            f"🟢 <code>{rs.hold_id}</code> {rs.kind} age={age} "
+            f"{s.get('date','?')} {s.get('time') or 'any'} "
+            f"full={s.get('full',0)} red={s.get('reduced',0)} audio={s.get('audio',0)}"
+        )
+        if verbose and rs.last_lines:
+            lines.append(f"  <i>{_html_escape(rs.last_lines[-1][:200])}</i>")
+    for rs in dead:
+        lines.append(f"🔴 <code>{rs.hold_id}</code> {rs.kind} (dead)")
+    return "\n".join(lines)
+
+
 @only_our_chat
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if STATE.proc and STATE.proc.returncode is None:
-        elapsed = (dt.datetime.utcnow() - STATE.started_at).total_seconds()
-        await _send(ctx,
-            f"🏃 running: <b>{STATE.mode}</b>  {STATE.args_summary}\n"
-            f"pid={STATE.proc.pid}  elapsed={elapsed:.0f}s\n"
-            f"log: <code>{STATE.log_path.name}</code>",
-            parse=ParseMode.HTML,
-        )
-    else:
-        await _send(ctx, "💤 idle — no run in flight")
+    """Carcere-style /status. Supports an optional hold_id arg and adds the
+    Refresh/Verbose buttons the mate already knows from the other bot."""
+    verbose = False
+    if ctx.args:
+        a = ctx.args[0].strip().lower()
+        if a in ("v", "verbose", "-v"): verbose = True
+    await ctx.bot.send_message(
+        chat_id=AUTHORIZED_CHAT,
+        text=_build_status_text(verbose=verbose),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=kbd([[("Refresh", "refreshstatus"),
+                            ("Verbose", "refreshstatus:verbose")]]),
+    )
 
 
 @only_our_chat
@@ -1823,6 +1961,164 @@ def _buyer_missing(sel: MenuSel) -> list[str]:
     return [k for k in _REQUIRED_BUYER_FIELDS if not getattr(sel, k, "")]
 
 
+_TICKET_RE = re.compile(r"(\d+)\s*(full|reduced|audio)", re.IGNORECASE)
+
+
+def _parse_tickets_spec(spec: str) -> dict:
+    """Parse '2full+1reduced+1audio' → {'full':2,'reduced':1,'audio':1}.
+    Missing keys default to 0. Returns {} on unparseable input."""
+    out = {"full": 0, "reduced": 0, "audio": 0}
+    found = False
+    for m in _TICKET_RE.finditer(spec or ""):
+        out[m.group(2).lower()] = int(m.group(1)); found = True
+    return out if found else {}
+
+
+@only_our_chat
+async def cmd_catch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/catch <date> [time] [tickets] [mode]
+
+    Carcere-style one-shot catch. Uses the current /setbuyer when mode=live.
+    Examples:
+      /catch 2026-12-25 17:00 1reduced hold
+      /catch 2026-12-25 any 2full+1reduced+1audio live
+      /catch 2026-12-25               (defaults: any time, 1 reduced, hold)
+    """
+    args = ctx.args or []
+    if not args:
+        await _send(ctx, "usage: <code>/catch &lt;date&gt; [time] [tickets] [mode]</code>\n"
+                         "e.g. <code>/catch 2026-12-25 17:00 2full+1reduced+1audio hold</code>",
+                    parse=ParseMode.HTML); return
+    date = args[0]
+    try: dt.datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        await _send(ctx, f"❌ bad date '{date}' — use YYYY-MM-DD"); return
+
+    time_arg    = ""
+    tickets_arg = ""
+    mode_arg    = "hold"
+    for a in args[1:]:
+        al = a.lower()
+        if al in ("hold","live","dry"):           mode_arg = al
+        elif _TICKET_RE.search(a):                tickets_arg = a
+        elif al == "any":                         time_arg = ""
+        elif re.fullmatch(r"\d{1,2}(:\d{2})?", a):time_arg = a
+        else:
+            await _send(ctx, f"❓ ignored unknown token: <code>{a}</code>",
+                        parse=ParseMode.HTML)
+
+    tickets = _parse_tickets_spec(tickets_arg) or {"full": 0, "reduced": 1, "audio": 0}
+    if tickets["full"] + tickets["reduced"] < 1:
+        tickets["reduced"] = 1
+
+    sel = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
+    sel.date = date
+    sel.time = time_arg
+    sel.full, sel.reduced, sel.audio = tickets["full"], tickets["reduced"], tickets["audio"]
+    sel.mode = mode_arg
+    _save_menu_state()
+    await _send(ctx,
+        f"🎯 catch <b>{mode_arg.upper()}</b> "
+        f"{date} {time_arg or 'any'} · "
+        f"full={tickets['full']} red={tickets['reduced']} audio={tickets['audio']}",
+        parse=ParseMode.HTML)
+    await _spawn_api_hold_from_menu(ctx, sel)
+
+
+@only_our_chat
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alias of /release (matches carcere's /stop)."""
+    await cmd_release(update, ctx)
+
+
+@only_our_chat
+async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/live <hold_id> — stream the subprocess's log tail every 5 s for 5 min.
+    Mirrors the carcere /live command (which uses a web stream); we send
+    each new interesting line to the chat because we don't host a web port."""
+    if not ctx.args:
+        await _send(ctx, "usage: <code>/live &lt;hold_id&gt;</code>  "
+                         "(see /held for ids)", parse=ParseMode.HTML); return
+    hid = ctx.args[0].strip().lstrip("#")
+    rs = HOLDS.get(hid)
+    if rs is None:
+        await _send(ctx, f"❌ no hold with id <code>{hid}</code>",
+                    parse=ParseMode.HTML); return
+    if rs.log_path is None or not rs.log_path.exists():
+        await _send(ctx, f"❌ log file not found for {hid}"); return
+
+    await _send(ctx, f"📡 live stream {hid} for 5 min")
+    deadline = time.monotonic() + 5 * 60
+    last_size = 0
+    try:
+        last_size = rs.log_path.stat().st_size
+    except Exception: pass
+    sent_any = False
+    while time.monotonic() < deadline:
+        await asyncio.sleep(5)
+        try:
+            with rs.log_path.open("r", encoding="utf-8", errors="replace") as f:
+                f.seek(last_size)
+                chunk = f.read()
+                last_size = f.tell()
+        except Exception as exc:
+            await _send(ctx, f"stream err: {exc}"); break
+        if not chunk.strip():
+            continue
+        sent_any = True
+        # Forward each interesting line; mimic the bot's streaming filter so
+        # we don't spam the whole Chrome debug output.
+        for line in chunk.splitlines():
+            msg = _match_line(line)
+            if msg:
+                try: await _send(ctx, f"[{hid}] {msg}", parse=ParseMode.HTML)
+                except Exception: pass
+    if not sent_any:
+        await _send(ctx, f"📡 stream {hid} done · no new events")
+    else:
+        await _send(ctx, f"📡 stream {hid} ended")
+
+
+@only_our_chat
+async def cmd_slots(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/slots [date] — tell the mate what Admission times exist for a date,
+    without catching. Pure read of Vatican's public API, no captcha.
+    Mirrors carcere's /slots. Default date = today+30 days."""
+    args = ctx.args or []
+    target = args[0] if args else (dt.date.today() + dt.timedelta(days=30)).isoformat()
+    try: dt.datetime.strptime(target, "%Y-%m-%d")
+    except ValueError:
+        await _send(ctx, f"❌ bad date '{target}' — use YYYY-MM-DD"); return
+    # Use the probe_slots path via a short-lived api_hold.py --hold-only dry
+    # run — spawn in background, pipe the "visit:" + "slot picked" lines.
+    cmd = [sys.executable, "api_hold.py",
+           "--date", target, "--days-ahead", "0", "--num", "1",
+           "--headless", "--session-aging-sec", "0",
+           "--rotate-ip", "--ip-retries", "3"]
+    await _send(ctx, f"🔎 probing Vatican for {target}…")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=str(BOT_DIR),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"},
+        )
+        lines = []
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=90)
+            text = (stdout or b"").decode("utf-8", errors="replace")
+        except asyncio.TimeoutError:
+            proc.kill(); text = ""
+        for line in text.splitlines():
+            if "visit:" in line or "slot picked" in line or "timetable" in line:
+                lines.append(line.split("|",1)[-1].strip())
+        body = "\n".join(lines[:30]) or "no slots returned"
+        await _send(ctx, f"<pre>{_html_escape(body[:3500])}</pre>",
+                    parse=ParseMode.HTML)
+    except Exception as exc:
+        await _send(ctx, f"/slots failed: {exc}")
+
+
 @only_our_chat
 async def cmd_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/pay <hold_id> — convert a HELD slot into a payable reservation.
@@ -1958,20 +2254,27 @@ async def cmd_last(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("dry",    cmd_dry))
-    app.add_handler(CommandHandler("hold",   cmd_hold))
-    app.add_handler(CommandHandler("menu",     cmd_menu))
-    app.add_handler(CommandHandler("cancel",   cmd_cancel))
-    app.add_handler(CommandHandler("logs",     cmd_logs))
-    app.add_handler(CommandHandler("last",     cmd_last))
-    app.add_handler(CommandHandler("setbuyer", cmd_setbuyer))
-    app.add_handler(CommandHandler("setnames", cmd_setnames))
+    app.add_handler(CommandHandler("help",   cmd_help))
+    app.add_handler(CommandHandler("menu",   cmd_menu))
+    # Catch + hold lifecycle (carcere-style verbs)
+    app.add_handler(CommandHandler("catch",    cmd_catch))
     app.add_handler(CommandHandler("held",     cmd_held))
-    app.add_handler(CommandHandler("release",  cmd_release))
     app.add_handler(CommandHandler("pay",      cmd_pay))
+    app.add_handler(CommandHandler("stop",     cmd_stop))        # alias of release
+    app.add_handler(CommandHandler("release",  cmd_release))
+    app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(CommandHandler("logs",     cmd_logs))
+    app.add_handler(CommandHandler("live",     cmd_live))
+    app.add_handler(CommandHandler("slots",    cmd_slots))
+    # Legacy /hold /dry /cancel still accepted
+    app.add_handler(CommandHandler("dry",      cmd_dry))
+    app.add_handler(CommandHandler("hold",     cmd_hold))
+    app.add_handler(CommandHandler("cancel",   cmd_cancel))
+    app.add_handler(CommandHandler("last",     cmd_last))
+    # Buyer form + shortcuts
     app.add_handler(CommandHandler("buyer",      cmd_buyer))
+    app.add_handler(CommandHandler("setbuyer",   cmd_setbuyer))
+    app.add_handler(CommandHandler("setnames",   cmd_setnames))
     app.add_handler(CommandHandler("resetbuyer", cmd_resetbuyer))
     # NB: must include "callback_query" so inline-menu button taps reach us.
     app.add_handler(CallbackQueryHandler(cb_menu))

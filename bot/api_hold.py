@@ -72,8 +72,12 @@ PAGE_URL = f"{BASE_URL}/home/checkout"
 # Matched against what the real Vatican SPA sends. Observed 2026-11-09
 # via spa_investigator.py: the SPA uses the "resultPerTag" endpoint with
 # tag=MV-Biglietti, area=2, who="" (empty) and lang=it.
-DEFAULT_AREA = 2
-DEFAULT_WHO  = ""
+# Vatican SPA route pattern: /home/fromtag/{areaId}/{timestamp}/MV-Biglietti/{who}
+# User's exact URL target: areaId=1 who=1 (Singles section, direct Admission).
+# Earlier we used areaId=2 who="" which worked but returned the aggregate
+# audience; areaId=1 who=1 matches the public landing page precisely.
+DEFAULT_AREA = 1
+DEFAULT_WHO  = "1"
 # User's successful manual checkout on 2026-11-11 16:41 UTC had LINGUA=en
 # in the Catholica form POST. Matching that so our Vatican /reservation
 # doesn't diverge from the working flow.
