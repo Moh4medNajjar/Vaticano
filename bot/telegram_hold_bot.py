@@ -833,21 +833,30 @@ def _live_jobs() -> list[RunState]:
 
 
 def _launcher_text() -> str:
-    """Matches sniper.js:mainMenuText. Shows live hunting/held counts in the
-    header so your mate sees state at a glance."""
+    """Matches sniper.js:mainMenuText style. Adds a Buyer line because Vatican
+    booking carries a per-visit `representativeUser` that sniper's Carcer/
+    Colosseo API does not — so the mate needs to see buyer readiness at a
+    glance (it's required right before /pay, not at hunt time)."""
     hunting = len(_hunting_jobs())
     held    = len(_held_jobs())
+    sel     = MENU.get(AUTHORIZED_CHAT) or MenuSel()
+    missing = _buyer_missing(sel)
+    buyer_badge = (f"👤 Buyer: ✅ {sel.first} {sel.last}" if not missing
+                   else "👤 Buyer: ⚠️ not set (needed before /pay)")
     return (f"🎯 <b>Vaticano Sniper</b>\n"
-            f"🎯 {hunting} hunting · ✅ {held} held")
+            f"🎯 {hunting} hunting · ✅ {held} held\n"
+            f"{buyer_badge}")
 
 
 def _launcher_kbd() -> InlineKeyboardMarkup:
-    """Matches sniper.js:mainMenuKb — 2x2 grid, dynamic jobs count, exact
-    callback_data names."""
+    """3x2 grid — sniper.js's 2x2 extended with a Buyer row (Vatican needs it)."""
     jobs_n = len(_live_jobs())
+    sel    = MENU.get(AUTHORIZED_CHAT) or MenuSel()
+    buyer_tag = "✅" if not _buyer_missing(sel) else "⚠️"
     return kbd([
         [("🎫 New hunt",    "cards"), (f"🎯 Jobs ({jobs_n})", "jobs")],
         [("📊 Consumption", "cons"),  ("🌐 Site status",      "site")],
+        [(f"{buyer_tag} Buyer", "buyer_open"), ("❓ Help", "help_open")],
     ])
 
 
@@ -877,20 +886,21 @@ def _jobs_screen() -> tuple[str, InlineKeyboardMarkup]:
         emoji = "✅" if snap else "🎯"
         tix  = (f"{s.get('full',0)}f+{s.get('reduced',0)}r"
                 + (f"+{s.get('audio',0)}a" if s.get('audio',0) else ""))
+        slot_label = f"{s.get('date','?')} {s.get('time') or 'any'}"
         lines.append(
-            f"{emoji} <code>{rs.hold_id}</code> {s.get('date','?')} "
-            f"{s.get('time') or 'any'} · {tix} · age {age_tag}"
+            f"{emoji} <b>{slot_label}</b> · {tix} · age {age_tag} "
+            f"<i>({rs.hold_id})</i>"
         )
-        # Per-job buttons: for longhold → Pay+Stop; for live → Pay-now+Stop
+        # Human-readable button labels: date + time, not hold-id
         if rs.kind == "longhold":
-            rows.append([(f"💳 {rs.hold_id}", f"h:pay:{rs.hold_id}"),
-                         (f"🛑 {rs.hold_id}", f"h:rel:{rs.hold_id}")])
+            rows.append([(f"💳 Pay {slot_label}",  f"h:pay:{rs.hold_id}"),
+                         (f"🛑 Stop {slot_label}", f"h:rel:{rs.hold_id}")])
         elif rs.kind == "live":
-            rows.append([(f"💳 {rs.hold_id} (pay)", f"h:paynow:{rs.hold_id}"),
-                         (f"🛑 {rs.hold_id}",       f"h:rel:{rs.hold_id}")])
+            rows.append([(f"💳 Pay form {slot_label}", f"h:paynow:{rs.hold_id}"),
+                         (f"🛑 Stop {slot_label}",     f"h:rel:{rs.hold_id}")])
         else:
-            rows.append([(f"🛑 {rs.hold_id}", f"h:rel:{rs.hold_id}")])
-    rows.append([("↩ Back", "main")])
+            rows.append([(f"🛑 Stop {slot_label}", f"h:rel:{rs.hold_id}")])
+    rows.append([("🔄 Refresh", "jobs"), ("↩ Back", "main")])
     return ("\n".join(lines), kbd(rows))
 
 
@@ -939,25 +949,34 @@ def _consumption_screen() -> tuple[str, InlineKeyboardMarkup]:
     rate_per_slot_mb_hr = 10.0 if hunting > 0 else 0.0   # rough: 10 MB/hr
     total_rate = rate_per_slot_mb_hr * (hunting + held)
 
-    body = ["📊 <b>Proxy consumption</b> (internal meter — no Evomi API)",
-            ""]
-    body.append(f"• Active: <b>{hunting}</b> hunting · <b>{held}</b> held")
-    body.append(f"• Est. session total: <b>{_format_mb(total_bytes)}</b>")
+    # Rough cost estimate — Evomi residential IT is roughly $3–5/GB.
+    USD_PER_GB_LOW  = 3.0
+    USD_PER_GB_HIGH = 5.0
+    gb_used = total_bytes / (1024**3)
+    usd_low  = gb_used * USD_PER_GB_LOW
+    usd_high = gb_used * USD_PER_GB_HIGH
+
+    body = ["📊 <b>Proxy consumption</b>", ""]
+    body.append(f"🎯 Hunting (active catches): <b>{hunting}</b>")
+    body.append(f"✅ Held (locked slots):     <b>{held}</b>")
+    body.append("")
+    body.append(f"📦 Data used this session: <b>{_format_mb(total_bytes)}</b>")
+    body.append(f"💰 Approx cost so far: <b>${usd_low:.2f}–${usd_high:.2f}</b> "
+                "<i>(at $3–5/GB)</i>")
     if total_rate > 0:
-        body.append(f"• Est. rate: <b>{total_rate:.1f} MB/hr</b>")
-        body.append(f"  ≈ <b>{(total_rate*24/1000):.2f} GB/day</b> at this load")
+        body.append(f"⚡ Rate right now: <b>~{total_rate:.1f} MB/hr</b> "
+                    f"(≈ ${(total_rate/1024*USD_PER_GB_HIGH):.2f}/hr)")
     else:
-        body.append("• Est. rate: <b>~0 MB/hr</b> (nothing hunting)")
+        body.append("⚡ Rate right now: <b>~0 MB/hr</b> (nothing hunting)")
     if per_job:
         body.append("")
-        body.append("<b>Per hold</b> (estimated share)")
+        body.append("<b>Per hold</b>")
         per_job.sort(key=lambda x: -x[1])
         for hid, b in per_job[:10]:
             body.append(f"  <code>{hid}</code>: {_format_mb(b)}")
     body.append("")
-    body.append("<i>Rates are rough estimates (no Evomi API key configured). "
-                "Live hunting dominates; held slots are cheap once /recap "
-                "lock is placed.</i>")
+    body.append("<i>Estimate only — no Evomi API key configured. Holding is "
+                "cheap; most data goes to the initial catches.</i>")
     return "\n".join(body), kbd([[("🔄 Refresh", "cons"), ("↩ Back", "main")]])
 
 
@@ -1122,6 +1141,26 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                                       disable_web_page_preview=True)
         except Exception as exc:
             log.debug("main edit failed: %s", exc)
+        return
+
+    if data == "buyer_open":
+        b = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
+        try:
+            await q.message.edit_text(
+                _buyer_form_text(b), parse_mode=ParseMode.HTML,
+                reply_markup=_buyer_form_render(b, "main"))
+        except Exception as exc:
+            log.debug("buyer_open failed: %s", exc)
+        return
+
+    if data == "help_open":
+        try:
+            await q.message.edit_text(
+                HELP_TEXT, parse_mode=ParseMode.HTML,
+                reply_markup=kbd([[("↩ Back", "main")]]),
+                disable_web_page_preview=True)
+        except Exception as exc:
+            log.debug("help_open failed: %s", exc)
         return
 
     # ---------- legacy top:* (kept so earlier messages still work) ----------
@@ -1831,30 +1870,10 @@ async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @only_our_chat
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _send(ctx,
-        "<b>Vatican Hold Bot</b>\n\n"
-        "<b>🎯 EASY MODE:</b>\n"
-        "/menu       — interactive buttons: date, time, product, tickets, "
-        "<b>📦 HOLD</b> (no captcha, keep for days) or <b>💳 PAY NOW</b>\n"
-        "/held       — show every slot you're keeping in your hand\n"
-        "/pay &lt;id&gt;   — convert a HOLD to a real payment (1 captcha)\n"
-        "/release &lt;id&gt; — stop refreshing a specific HOLD\n"
-        "/buyer      — tap-each-field form for the visitor (easy for your mate)\n"
-        "/setbuyer first=… last=… email=… phone=… country=… city=… gender=M|F birth=YYYY-MM-DD\n"
-        "/setnames First1 Last1, First2 Last2, …   — per-visitor names\n"
-        "/resetbuyer — wipe the current buyer\n\n"
-        "<b>Direct commands:</b>\n"
-        "/dry   &lt;YYYY-MM-DD&gt; [num]   — exercise flow up to /recap (no captcha)\n"
-        "/hold  &lt;YYYY-MM-DD&gt; [num]   — LIVE: spend 1 captcha, catch a real ~15 min hold\n"
-        "/status      — most recent run\n"
-        "/logs [id]   — last 30 lines of a run\n"
-        "/last        — summary of most recent reports/hold_*.json\n"
-        "/cancel [id] — kill one run (no id = the current)\n\n"
-        f"chat_id locked to: <code>{AUTHORIZED_CHAT}</code>\n"
-        f"captcha key: {'✅ set' if YESCAPTCHA_KEY else '❌ missing'}\n"
-        f"proxy pool:  loading from Vaticano/proxies.txt",
-        parse=ParseMode.HTML,
-    )
+    """Show the main menu directly — matches sniper.js's /start behaviour.
+    For the full command reference, the mate taps ❓ Help or sends /help."""
+    _MENU_MSG_ID.pop(AUTHORIZED_CHAT, None)
+    await _render_main_menu(ctx)
 
 
 def _build_status_text(verbose: bool = False) -> str:
@@ -2317,17 +2336,16 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @only_our_chat
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/live <hold_id> — stream the subprocess's log tail every 5 s for 5 min.
-    Mirrors the carcere /live command (which uses a web stream); we send
-    each new interesting line to the chat because we don't host a web port."""
-    if not ctx.args:
-        await _send(ctx, "usage: <code>/live &lt;hold_id&gt;</code>  "
-                         "(see /held for ids)", parse=ParseMode.HTML); return
-    hid = ctx.args[0].strip().lstrip("#")
-    rs = HOLDS.get(hid)
+    """/live <hold_id> — stream that hold's new log lines for 5 min.
+    /live — picks the most-recent live hold."""
+    rs: Optional[RunState] = None
+    if ctx.args:
+        rs = HOLDS.get(ctx.args[0].strip().lstrip("#"))
+    else:
+        rs = _active_hold()
     if rs is None:
-        await _send(ctx, f"❌ no hold with id <code>{hid}</code>",
-                    parse=ParseMode.HTML); return
+        await _send(ctx, "💤 no live runs — /menu → 🎫 New hunt first."); return
+    hid = rs.hold_id
     if rs.log_path is None or not rs.log_path.exists():
         await _send(ctx, f"❌ log file not found for {hid}"); return
 
@@ -2405,12 +2423,28 @@ async def cmd_slots(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @only_our_chat
 async def cmd_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/pay <hold_id> — convert a HELD slot into a payable reservation.
-    Spends ONE Turnstile solve (~$0.005). Prefer the 💳 button in /held."""
+    """/pay <hold_id> — pay a specific hold.
+    /pay (no args) — shows a picker of live HOLDs to tap."""
     if not ctx.args:
-        await _send(ctx, "usage: <code>/pay &lt;hold_id&gt;</code>  "
-                         "(or tap 💳 Send to checkout in /held)",
-                    parse=ParseMode.HTML); return
+        longholds = [rs for rs in HOLDS.values()
+                     if rs.kind == "longhold"
+                     and rs.proc and rs.proc.returncode is None]
+        if not longholds:
+            await _send(ctx,
+                "💤 nothing to pay. Catch a HOLD first (🎫 New hunt in /menu)."
+            ); return
+        rows = []
+        for rs in longholds:
+            s = rs.slot_meta or {}
+            label = (f"💳 {s.get('date','?')} {s.get('time') or 'any'} "
+                     f"· {s.get('full',0)}f+{s.get('reduced',0)}r")
+            rows.append([(label, f"h:pay:{rs.hold_id}")])
+        rows.append([("↩ Back", "main")])
+        await ctx.bot.send_message(
+            chat_id=AUTHORIZED_CHAT,
+            text="<b>💳 Which hold do you want to pay?</b>",
+            reply_markup=kbd(rows), parse_mode=ParseMode.HTML)
+        return
     hid = ctx.args[0].strip().lstrip("#")
     ok, msg = await _do_pay(ctx, hid)
     await _send(ctx, msg)
@@ -2418,17 +2452,29 @@ async def cmd_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @only_our_chat
 async def cmd_logs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/logs [hold_id] — tail the given hold, or the most recent run if no id."""
+    """/logs <hold_id> — tail that hold's log. /logs — picks the most recent."""
     rs: Optional[RunState] = None
     if ctx.args:
         rs = HOLDS.get(ctx.args[0].strip().lstrip("#"))
-    rs = rs or _active_hold()
-    if rs is None:
-        await _send(ctx, "no runs"); return
+        if rs is None:
+            await _send(ctx, f"❌ no hold <code>{ctx.args[0]}</code>",
+                        parse=ParseMode.HTML); return
+    else:
+        rs = _active_hold()
+        if rs is None:
+            await _send(ctx, "💤 no runs — /menu → 🎫 New hunt first."); return
     lines = rs.last_lines[-30:]
     if not lines:
-        await _send(ctx, f"no lines yet for {rs.hold_id or '(current)'}")
-        return
+        # Pull directly from the log file if the in-memory buffer is empty
+        # (e.g. after a bot restart with a reloaded shell entry).
+        try:
+            if rs.log_path and rs.log_path.exists():
+                with rs.log_path.open("r", encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()[-30:]
+        except Exception: pass
+    if not lines:
+        await _send(ctx, f"no lines yet for <code>{rs.hold_id}</code>",
+                    parse=ParseMode.HTML); return
     body = "\n".join(lines)[-3500:]
     await _send(ctx, f"<b>{rs.hold_id}</b>\n<pre>{_html_escape(body)}</pre>",
                 parse=ParseMode.HTML)
