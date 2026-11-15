@@ -802,30 +802,240 @@ def kbd(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
          for row in rows])
 
 
-# Mirrors underground/bot/botmanager/botmanager.py:cmd_menu — 3x3 grid, terse
-# labels, no walls of text. Your mate carries over the same muscle memory.
-def _launcher_kbd() -> InlineKeyboardMarkup:
-    return kbd([
-        [("Catch",  "top:catch"),  ("Held",   "top:held"),   ("Pay",   "top:pay")],
-        [("Status", "top:status"), ("Logs",   "top:logs"),   ("Live",  "top:live")],
-        [("Buyer",  "top:buyer"),  ("Slots",  "top:slots"),  ("More",  "top:more")],
-    ])
+# Mirrors omniavaticanrome/sniper.js:mainMenuText + mainMenuKb — same header
+# shape, same 2x2 grid, same callback_data names ('cards','jobs','cons','site')
+# so an operator onboarding from the Carcer Tullianum + Colosseo bot reads
+# the exact same screen.
+def _hunting_jobs() -> list[RunState]:
+    """Jobs currently trying to grab the slot (process alive AND no snapshot yet)."""
+    out = []
+    for rs in HOLDS.values():
+        if not (rs.proc and rs.proc.returncode is None): continue
+        snap = _latest_snapshot_for(rs)
+        if snap is None: out.append(rs)
+    return out
+
+
+def _held_jobs() -> list[RunState]:
+    """Jobs with an active server-side hold (snapshot exists + process alive)."""
+    out = []
+    for rs in HOLDS.values():
+        if not (rs.proc and rs.proc.returncode is None): continue
+        snap = _latest_snapshot_for(rs)
+        if snap is not None: out.append(rs)
+    return out
+
+
+def _live_jobs() -> list[RunState]:
+    """Any hold with a live subprocess."""
+    return [rs for rs in HOLDS.values()
+            if rs.proc and rs.proc.returncode is None]
 
 
 def _launcher_text() -> str:
-    return "What do you want to do?"
+    """Matches sniper.js:mainMenuText. Shows live hunting/held counts in the
+    header so your mate sees state at a glance."""
+    hunting = len(_hunting_jobs())
+    held    = len(_held_jobs())
+    return (f"🎯 <b>Vaticano Sniper</b>\n"
+            f"🎯 {hunting} hunting · ✅ {held} held")
+
+
+def _launcher_kbd() -> InlineKeyboardMarkup:
+    """Matches sniper.js:mainMenuKb — 2x2 grid, dynamic jobs count, exact
+    callback_data names."""
+    jobs_n = len(_live_jobs())
+    return kbd([
+        [("🎫 New hunt",    "cards"), (f"🎯 Jobs ({jobs_n})", "jobs")],
+        [("📊 Consumption", "cons"),  ("🌐 Site status",      "site")],
+    ])
+
+
+# Track the current menu message id per chat so cmd_menu can tgEdit instead
+# of spamming a new message — matches sniper.js's S.menuMsgs[chatId] pattern.
+_MENU_MSG_ID: dict[int, int] = {}
+
+
+def _jobs_screen() -> tuple[str, InlineKeyboardMarkup]:
+    """Mirrors sniper.js jobsCardsText + jobsCardsKb. One card per live job.
+    Since Telegram can't show N independent cards in a single edit, we put
+    a concise summary in the text and per-job buttons below."""
+    jobs = sorted(_live_jobs(),
+                  key=lambda r: r.started_at or dt.datetime.min, reverse=True)
+    if not jobs:
+        return ("🎯 <b>Jobs</b>\n\nNothing hunting or held right now.\n"
+                "Tap 🎫 New hunt to catch a slot.",
+                kbd([[("↩ Back", "main")]]))
+    lines = ["🎯 <b>Jobs</b>", ""]
+    rows = []
+    for rs in jobs:
+        s    = rs.slot_meta or {}
+        age  = ((dt.datetime.utcnow() - rs.started_at).total_seconds()
+                if rs.started_at else 0)
+        age_tag = f"{int(age/60)}m{int(age%60):02d}s"
+        snap = _latest_snapshot_for(rs)
+        emoji = "✅" if snap else "🎯"
+        tix  = (f"{s.get('full',0)}f+{s.get('reduced',0)}r"
+                + (f"+{s.get('audio',0)}a" if s.get('audio',0) else ""))
+        lines.append(
+            f"{emoji} <code>{rs.hold_id}</code> {s.get('date','?')} "
+            f"{s.get('time') or 'any'} · {tix} · age {age_tag}"
+        )
+        # Per-job buttons: for longhold → Pay+Stop; for live → Pay-now+Stop
+        if rs.kind == "longhold":
+            rows.append([(f"💳 {rs.hold_id}", f"h:pay:{rs.hold_id}"),
+                         (f"🛑 {rs.hold_id}", f"h:rel:{rs.hold_id}")])
+        elif rs.kind == "live":
+            rows.append([(f"💳 {rs.hold_id} (pay)", f"h:paynow:{rs.hold_id}"),
+                         (f"🛑 {rs.hold_id}",       f"h:rel:{rs.hold_id}")])
+        else:
+            rows.append([(f"🛑 {rs.hold_id}", f"h:rel:{rs.hold_id}")])
+    rows.append([("↩ Back", "main")])
+    return ("\n".join(lines), kbd(rows))
+
+
+def _format_mb(b: float) -> str:
+    if b >= 1024*1024*1024: return f"{b/(1024**3):.2f} GB"
+    if b >= 1024*1024:      return f"{b/(1024**2):.1f} MB"
+    if b >= 1024:           return f"{b/1024:.1f} KB"
+    return f"{b:.0f} B"
+
+
+def _consumption_screen() -> tuple[str, InlineKeyboardMarkup]:
+    """Mirrors sniper.js:consumptionText. No Evomi API, so this is estimated
+    from our subprocess activity (≈1 MB per F5 solve + ~5 KB per /recap POST
+    + ~3 KB per GET keepalive). Still useful to see per-hold burn and the
+    hunting/held split.
+    """
+    hunting = len(_hunting_jobs())
+    held    = len(_held_jobs())
+    jobs    = _live_jobs()
+
+    # Rough internal byte meter: scan each job's subprocess log for cycles
+    # and multiply by the measured per-cycle averages.
+    AVG_F5_SOLVE_BYTES   = 1_000_000   # ~1 MB per fresh F5 TSPD solve
+    AVG_RECAP_POST_BYTES =     5_000   # POST /recap + response
+    AVG_GET_BYTES        =     3_000   # cheap /api/config/isAgency etc.
+
+    per_job: list[tuple[str, int]] = []
+    total_bytes = 0
+    for rs in jobs:
+        f5_n = recap_n = get_n = 0
+        try:
+            if rs.log_path and rs.log_path.exists():
+                txt = rs.log_path.read_text(encoding="utf-8", errors="replace")
+                f5_n    = txt.count("F5 solve finished")
+                recap_n = txt.count("/recap OK")
+                get_n   = sum(1 for line in txt.splitlines()
+                              if "GET /api/" in line and "→ HTTP 200" in line)
+        except Exception: pass
+        b = f5_n*AVG_F5_SOLVE_BYTES + recap_n*AVG_RECAP_POST_BYTES + get_n*AVG_GET_BYTES
+        total_bytes += b
+        if b > 0: per_job.append((rs.hold_id, b))
+
+    # Rate: estimate across live hunting jobs — 1 /recap cycle every ~2 min
+    # per rotating-rerecap config = ~5 KB/min = ~300 KB/hr per slot, plus
+    # occasional F5 solve adds ~1 MB every ~6 min per slot.
+    rate_per_slot_mb_hr = 10.0 if hunting > 0 else 0.0   # rough: 10 MB/hr
+    total_rate = rate_per_slot_mb_hr * (hunting + held)
+
+    body = ["📊 <b>Proxy consumption</b> (internal meter — no Evomi API)",
+            ""]
+    body.append(f"• Active: <b>{hunting}</b> hunting · <b>{held}</b> held")
+    body.append(f"• Est. session total: <b>{_format_mb(total_bytes)}</b>")
+    if total_rate > 0:
+        body.append(f"• Est. rate: <b>{total_rate:.1f} MB/hr</b>")
+        body.append(f"  ≈ <b>{(total_rate*24/1000):.2f} GB/day</b> at this load")
+    else:
+        body.append("• Est. rate: <b>~0 MB/hr</b> (nothing hunting)")
+    if per_job:
+        body.append("")
+        body.append("<b>Per hold</b> (estimated share)")
+        per_job.sort(key=lambda x: -x[1])
+        for hid, b in per_job[:10]:
+            body.append(f"  <code>{hid}</code>: {_format_mb(b)}")
+    body.append("")
+    body.append("<i>Rates are rough estimates (no Evomi API key configured). "
+                "Live hunting dominates; held slots are cheap once /recap "
+                "lock is placed.</i>")
+    return "\n".join(body), kbd([[("🔄 Refresh", "cons"), ("↩ Back", "main")]])
+
+
+def _site_status_screen() -> tuple[str, InlineKeyboardMarkup]:
+    """Mirrors sniper.js:siteStatusText. For Vatican we don't have an API-
+    layer health probe — we show the last successful catch time, last F5
+    rejection time, and whether we're currently rate-limited (any job with
+    a recent F5 reject in its log)."""
+    now = dt.datetime.utcnow()
+    last_recap: Optional[dt.datetime] = None
+    last_reject: Optional[dt.datetime] = None
+    for rs in HOLDS.values():
+        if not rs.log_path or not rs.log_path.exists(): continue
+        try:
+            txt = rs.log_path.read_text(encoding="utf-8", errors="replace")
+        except Exception: continue
+        for line in txt.splitlines()[-500:]:
+            if "/recap OK" in line and "[INFO]" in line:
+                try:
+                    t = dt.datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+                    if last_recap is None or t > last_recap: last_recap = t
+                except Exception: pass
+            if ("Request Rejected" in line or "F5 REJECTED" in line or
+                "406" in line and "Bot" in line):
+                try:
+                    t = dt.datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+                    if last_reject is None or t > last_reject: last_reject = t
+                except Exception: pass
+
+    body = ["🌐 <b>Site status</b>  (tickets.museivaticani.va)", ""]
+    if last_recap:
+        age = int((now - last_recap).total_seconds())
+        body.append(f"✅ Last /recap OK: <b>{int(age/60)}m{age%60:02d}s ago</b>")
+    else:
+        body.append("✅ Last /recap OK: — no catch yet")
+    if last_reject:
+        age = int((now - last_reject).total_seconds())
+        symbol = "⚠️" if age < 300 else "·"
+        body.append(f"{symbol} Last F5 reject: <b>{int(age/60)}m{age%60:02d}s ago</b>")
+    else:
+        body.append("· Last F5 reject: — none observed")
+    body.append("")
+    body.append(f"🎯 Hunting: {len(_hunting_jobs())}")
+    body.append(f"✅ Held:    {len(_held_jobs())}")
+    body.append("")
+    body.append("<i>F5 TSPD + Cloudflare Turnstile are the two gates. "
+                "Reject in last 5 min means the site is velocity-blocking "
+                "our IP pool — expect slower rotations.</i>")
+    return "\n".join(body), kbd([[("🔄 Refresh", "site"), ("↩ Back", "main")]])
+
+
+async def _render_main_menu(ctx: ContextTypes.DEFAULT_TYPE,
+                            edit_message: Optional[int] = None) -> None:
+    """Send or edit the main-menu message. Mirrors tgEdit(chatId, text, kb)."""
+    txt = _launcher_text()
+    kb  = _launcher_kbd()
+    if edit_message:
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=AUTHORIZED_CHAT, message_id=edit_message,
+                text=txt, reply_markup=kb, parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True)
+            return
+        except Exception as exc:
+            log.debug("menu edit failed, falling back to send: %s", exc)
+    msg = await ctx.bot.send_message(
+        chat_id=AUTHORIZED_CHAT, text=txt, reply_markup=kb,
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    _MENU_MSG_ID[AUTHORIZED_CHAT] = msg.message_id
 
 
 @only_our_chat
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Top-level launcher. Every other screen can get back here via ↩ Back."""
-    await ctx.bot.send_message(
-        chat_id=AUTHORIZED_CHAT,
-        text=_launcher_text(),
-        reply_markup=_launcher_kbd(),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
+    """Top-level launcher — identical to sniper.js /menu."""
+    # Sniper's pattern: /menu drops the menu msg_id so a fresh card is sent,
+    # then subsequent sub-screen taps edit THAT card.
+    _MENU_MSG_ID.pop(AUTHORIZED_CHAT, None)
+    await _render_main_menu(ctx)
 
 
 async def _open_catch_config(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -872,7 +1082,49 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             log.debug("refreshstatus edit failed: %s", exc)
         return
 
-    # ---------- top-level launcher ----------
+    # ---------- sniper.js-style top-level ----------
+    if data == "cards":
+        # 🎫 New hunt — open the catch-config screen (existing flow)
+        await _open_catch_config(q, ctx); return
+
+    if data == "jobs":
+        txt, markup = _jobs_screen()
+        try:
+            await q.message.edit_text(txt, parse_mode=ParseMode.HTML,
+                                      reply_markup=markup)
+        except Exception as exc:
+            log.debug("jobs render failed: %s", exc)
+        return
+
+    if data == "cons":
+        txt, markup = _consumption_screen()
+        try:
+            await q.message.edit_text(txt, parse_mode=ParseMode.HTML,
+                                      reply_markup=markup)
+        except Exception as exc:
+            log.debug("cons render failed: %s", exc)
+        return
+
+    if data == "site":
+        txt, markup = _site_status_screen()
+        try:
+            await q.message.edit_text(txt, parse_mode=ParseMode.HTML,
+                                      reply_markup=markup)
+        except Exception as exc:
+            log.debug("site render failed: %s", exc)
+        return
+
+    if data == "main":
+        # Back to main menu (edit in place)
+        try:
+            await q.message.edit_text(_launcher_text(), parse_mode=ParseMode.HTML,
+                                      reply_markup=_launcher_kbd(),
+                                      disable_web_page_preview=True)
+        except Exception as exc:
+            log.debug("main edit failed: %s", exc)
+        return
+
+    # ---------- legacy top:* (kept so earlier messages still work) ----------
     if parts[0] == "top":
         action = parts[1] if len(parts) > 1 else ""
 
@@ -1508,41 +1760,73 @@ async def _spawn_api_hold_from_menu(ctx: ContextTypes.DEFAULT_TYPE,
 
 
 # --------------------------------------------------------------------- commands
-HELP_TEXT = """<b>Vatican Hold Bot Commands:</b>
+HELP_TEXT = """🎯 <b>Vaticano Sniper — commands</b>
 
-/menu — Interactive menu with buttons
-/catch &lt;date&gt; [time] [tickets] [mode] — Catch & hold a slot
-/held — Held slots + Pay/Release buttons
-/pay &lt;hold_id&gt; — Send a held slot to Catholica (1 captcha)
-/stop &lt;hold_id&gt; — Stop holding (alias: /release)
-/status [hold_id] — Hold status + health
-/logs &lt;hold_id&gt; [lines] — View logs (default 30)
-/live &lt;hold_id&gt; — Stream the catch (5 min poll)
-/slots [date] — Vatican availability for a date
-/buyer — Step-by-step buyer form
-/setbuyer first=… last=… email=… — One-shot buyer set
-/setnames First1 Last1, First2 Last2 — Per-visitor names
-/resetbuyer — Wipe buyer data
+<b>Main</b>
+/menu          — main menu (🎫 New hunt · 🎯 Jobs · 📊 Consumption · 🌐 Site)
+/jobs (/holds) — list every hunting + held slot, with Pay/Release buttons
+/consumption (/usage) — Evomi/proxy burn estimate per hold
+/site          — Vatican API health (last /recap OK, last F5 reject)
+/refresh       — refresh menu counts
 
-Modes: hold (no captcha, auto-refresh), live (1 captcha, instant pay)
+<b>Hunt / Hold / Pay</b>
+/catch &lt;date&gt; [time] [tickets] [mode]
+   e.g. /catch 2026-12-25 17:00 2full+1reduced+1audio hold
+   Modes: hold (auto-refresh, no captcha) · live (1 captcha, instant pay)
+/pay &lt;hold_id&gt;      — send a held slot to Catholica (1 captcha)
+/stop &lt;hold_id&gt;     — stop holding (alias: /release)
+/status [v]         — compact table (v = verbose)
+/logs &lt;hold_id&gt;     — last 30 subprocess log lines
+/live &lt;hold_id&gt;     — 5-min streaming log tail
+/slots [date]       — probe Vatican availability (no captcha)
 
-Ticket syntax in /catch: <code>Nfull</code>, <code>Nreduced</code>, <code>Naudio</code>, combined with <code>+</code>
-  e.g. <code>2full+1reduced+1audio</code> = 3 visitors + 1 audioguide
+<b>Buyer</b>
+/buyer              — step-by-step form (tap each field, send value)
+/setbuyer first=… last=… email=… phone=… country=… city=… gender=M|F birth=YYYY-MM-DD
+/setnames First1 Last1, First2 Last2 — per-visitor names
+/resetbuyer         — wipe buyer data
 
-Examples:
-/catch 2026-12-25 17:00 1reduced hold
-/catch 2026-12-25 any 2full+1reduced live
-/pay h1794696719
-/status
-/held
-/logs h1794696719
-/slots 2026-12-25
+Legacy aliases preserved: /dry /hold /cancel /last /release
 """
 
 
 @only_our_chat
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _send(ctx, HELP_TEXT, parse=ParseMode.HTML)
+
+
+# ── sniper.js-style commands ─────────────────────────────────────────────
+@only_our_chat
+async def cmd_jobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Same as tapping 🎯 Jobs in the menu. Alias: /holds."""
+    txt, markup = _jobs_screen()
+    await ctx.bot.send_message(chat_id=AUTHORIZED_CHAT, text=txt,
+                               reply_markup=markup, parse_mode=ParseMode.HTML,
+                               disable_web_page_preview=True)
+
+
+@only_our_chat
+async def cmd_consumption(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Same as tapping 📊 Consumption. Aliases: /usage."""
+    txt, markup = _consumption_screen()
+    await ctx.bot.send_message(chat_id=AUTHORIZED_CHAT, text=txt,
+                               reply_markup=markup, parse_mode=ParseMode.HTML,
+                               disable_web_page_preview=True)
+
+
+@only_our_chat
+async def cmd_site(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Same as tapping 🌐 Site status."""
+    txt, markup = _site_status_screen()
+    await ctx.bot.send_message(chat_id=AUTHORIZED_CHAT, text=txt,
+                               reply_markup=markup, parse_mode=ParseMode.HTML,
+                               disable_web_page_preview=True)
+
+
+@only_our_chat
+async def cmd_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/refresh — same name as sniper. Shows the menu with fresh counts."""
+    await _render_main_menu(ctx)
 
 
 @only_our_chat
@@ -2256,6 +2540,13 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CommandHandler("menu",   cmd_menu))
+    # Sniper.js-style verbs (Carcer Tullianum + Colosseo bot's exact surface)
+    app.add_handler(CommandHandler("jobs",        cmd_jobs))
+    app.add_handler(CommandHandler("holds",       cmd_jobs))
+    app.add_handler(CommandHandler("consumption", cmd_consumption))
+    app.add_handler(CommandHandler("usage",       cmd_consumption))
+    app.add_handler(CommandHandler("site",        cmd_site))
+    app.add_handler(CommandHandler("refresh",     cmd_refresh))
     # Catch + hold lifecycle (carcere-style verbs)
     app.add_handler(CommandHandler("catch",    cmd_catch))
     app.add_handler(CommandHandler("held",     cmd_held))
