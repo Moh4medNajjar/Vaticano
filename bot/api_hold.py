@@ -408,6 +408,164 @@ def build_reservation_config(slot: Slot, args) -> dict:
     }
 
 
+async def _watch_drop_loop(f5: F5Session, args) -> dict:
+    """SC2 — snipe a slot at a known drop time.
+
+    Flow (mirrors CIMEA's monitor.sh forever + Colosseo sniper.js's team pattern):
+      1. We're called AFTER F5 is solved on a warm Chrome. If we have time
+         before --watch-drop-at, sit idle with light scroll/hover (the
+         session cookies stay fresh; no tight-polling the site yet).
+      2. At drop_at - 2 s, switch to tight GET /api/visit/timeavail polling.
+         Each poll: look for our target time's `availability == AVAILABLE`
+         and `residual >= visitorNum`. Grab its visit_id (Vatican re-uses
+         slot ids but to be safe we re-read each poll).
+      3. On first AVAILABLE: POST /recap IMMEDIATELY with the fresh visit_id
+         and our ticket mix.  If 200 → slot ours, log and return.
+         If 500 (no tickets) → someone else got it first in that poll
+         window; keep polling for recycles (people who win but don't pay
+         in 15 min release their hold back to the pool).
+      4. Fire window = --watch-window-min minutes after drop_at. After
+         that: give up cleanly with `result=watch_timeout`.
+    """
+    import asyncio as _asyncio
+    import time as _time
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+    drop_at_str = getattr(args, "watch_drop_at", "")
+    if not drop_at_str:
+        return {"error": "no --watch-drop-at"}
+    try:
+        # Accept "2026-11-18T09:00" (naive → interpret as Europe/Rome) or ISO with tz.
+        d = _dt.fromisoformat(drop_at_str)
+        if d.tzinfo is None:
+            # Naive = Rome time
+            try:
+                from zoneinfo import ZoneInfo
+                d = d.replace(tzinfo=ZoneInfo("Europe/Rome"))
+            except Exception:
+                # Fallback: assume UTC+1 (winter) / +2 (summer) crudely
+                d = d.replace(tzinfo=_tz(_td(hours=1)))
+        drop_at_utc = d.astimezone(_tz.utc)
+    except Exception as exc:
+        return {"error": f"bad --watch-drop-at ({exc}) — use ISO like 2026-11-18T09:00"}
+
+    poll_sec    = max(1,  int(getattr(args, "watch_poll_sec",   2) or 2))
+    window_min  = max(1,  int(getattr(args, "watch_window_min", 30) or 30))
+    tight_lead  = 2  # seconds before drop to start tight polling
+
+    log.info("👁 WATCH armed — target %s %s · drop_at=%s UTC (%s Rome) "
+             "· poll=%ds · window=%d min",
+             args.date, args.time or "any", drop_at_utc.isoformat(),
+             d.isoformat(), poll_sec, window_min)
+
+    # ── 1. Discover target visit_type_id up front ───────────────────────
+    try:
+        await api_get_json(f5, "/api/search/filter",
+                           {"lang": DEFAULT_LANG, "areaId": DEFAULT_AREA,
+                            "tag": "MV-Biglietti"}, retries=1)
+        res = await api_get_json(f5, "/api/search/resultPerTag", {
+            "lang": DEFAULT_LANG, "visitorNum": args.num,
+            "visitDate": to_dmy(args.date), "area": DEFAULT_AREA,
+            "who": DEFAULT_WHO, "page": 0, "tag": "MV-Biglietti",
+        }, retries=1)
+    except Exception as exc:
+        return {"error": f"pre-drop visit lookup failed: {exc}"}
+    matches = [v for v in res.get("visits", [])
+               if all(k.lower() in (v.get("name","") or "").lower()
+                      for k in VISIT_NAME_REQUIRED)]
+    if not matches:
+        return {"error": "no matching visit type for target date (yet)"}
+    vt = matches[0]
+    visit_type_id = int(vt["id"])
+    visit_type_name = vt.get("name","")
+    log.info("👁 target visit_type_id=%s (%s)", visit_type_id, visit_type_name)
+
+    # ── 2. Idle until drop_at - 2s ──────────────────────────────────────
+    page = f5._page
+    while True:
+        now = _dt.now(_tz.utc)
+        remaining = (drop_at_utc - now).total_seconds()
+        if remaining <= tight_lead:
+            break
+        # Light scroll every 20 s to keep session warm
+        try: await page.evaluate("window.scrollBy(0, Math.floor(Math.random()*120)-60)")
+        except Exception: pass
+        log.info("👁 idle, %.0f s until drop", remaining)
+        await _asyncio.sleep(min(20, remaining - tight_lead))
+
+    log.info("👁 ENTERING FIRE WINDOW — tight polling every %ds", poll_sec)
+
+    # ── 3. Fire window: tight poll + fire on match ──────────────────────
+    deadline = drop_at_utc + _td(minutes=window_min)
+    polls = 0
+    fires = 0
+    attempts: list[dict] = []
+    while _dt.now(_tz.utc) < deadline:
+        polls += 1
+        try:
+            tt = await api_get_json(f5, "/api/visit/timeavail", {
+                "lang": DEFAULT_LANG, "visitLang": "",
+                "visitTypeId": visit_type_id,
+                "visitorNum": args.num,
+                "visitDate": to_dmy(args.date),
+            }, retries=1)
+        except Exception as exc:
+            log.warning("👁 poll %d: timeavail err %s", polls, str(exc)[:120])
+            await _asyncio.sleep(poll_sec); continue
+
+        target_hhmm = (args.time or "").strip()
+        hit: Optional[dict] = None
+        for t in (tt.get("timetable") or []):
+            if target_hhmm and not (t.get("time") or "").startswith(target_hhmm):
+                continue
+            av = (t.get("availability") or "").upper()
+            resid = int(t.get("residual") or 0)
+            if av == "AVAILABLE" and resid >= args.num:
+                hit = t; break
+
+        if not hit:
+            if polls % 5 == 0:
+                log.info("👁 poll %d: target still not AVAILABLE "
+                         "(sample: %s)", polls,
+                         [(t.get("time"), t.get("availability"), t.get("residual"))
+                          for t in (tt.get("timetable") or [])[:5]])
+            await _asyncio.sleep(poll_sec); continue
+
+        # ── 4. FIRE ──────────────────────────────────────────────────────
+        visit_id = hit["id"]
+        log.info("👁🔥 HIT at poll %d — time=%s id=%s resid=%s · firing /recap",
+                 polls, hit.get("time"), visit_id, hit.get("residual"))
+        fires += 1
+        slot = Slot(
+            visit_type_id=visit_type_id, visit_type_name=visit_type_name,
+            visit_id=visit_id, visit_date=to_dmy(args.date),
+            visit_time=hit.get("time",""), availability="AVAILABLE",
+        )
+        cfg = build_reservation_config(slot, args)
+        try:
+            recap = await post_recap(f5, cfg)
+            log.info("👁✅ WON · reservationId=%s", recap.get("reservationId"))
+            return {
+                "result": "watched_and_caught",
+                "slot": asdict(slot),
+                "recap": recap,
+                "polls": polls, "fires": fires,
+                "attempts": attempts,
+            }
+        except Exception as exc:
+            emsg = str(exc)[:180]
+            attempts.append({"poll": polls, "visit_id": visit_id,
+                             "error": emsg})
+            log.warning("👁 fire %d lost: %s — back to polling for recycles",
+                        fires, emsg)
+            await _asyncio.sleep(poll_sec); continue
+
+    log.warning("👁 window expired (%d polls, %d fires) — nothing caught",
+                polls, fires)
+    return {"result": "watch_timeout", "polls": polls, "fires": fires,
+            "attempts": attempts}
+
+
 async def post_recap(f5: F5Session, cfg: dict) -> dict:
     # Matches the SPA's /recap body — no visitLang, no extra keys.
     body = {
@@ -1418,6 +1576,37 @@ async def main_async(args) -> dict:
                              args.session_aging_sec)
                     await _session_aging(f5, args.session_aging_sec)
 
+                # SC2 WATCH mode diverges here: skip find_slot (which only
+                # sees already-AVAILABLE slots) and head straight to the drop
+                # loop. The watch loop runs its own timeavail poll and fires
+                # /recap the moment the target flips.
+                if getattr(args, "watch_drop_at", ""):
+                    log.info("--- WATCH drop-sniper mode ---")
+                    out["result"] = "watched"
+                    try:
+                        watch_out = await _watch_drop_loop(f5, args)
+                        out.update(watch_out)
+                    except Exception as exc:
+                        log.error("WATCH loop crashed: %s", exc)
+                        out["result"] = "watch_crash"; out["error"] = str(exc)
+                    # If caught, feed snapshot + handoff to rotating-recap
+                    if out.get("result") == "watched_and_caught":
+                        reports = pathlib.Path(__file__).resolve().parent.parent / "reports"
+                        reports.mkdir(exist_ok=True)
+                        early_fname = f"hold_{int(time.time())}_watched.json"
+                        try:
+                            (reports / early_fname).write_text(
+                                json.dumps(out, indent=2, default=str), encoding="utf-8")
+                            log.info("💾 watched catch snapshot: %s", early_fname)
+                        except Exception: pass
+                        # Convert the caught slot into the same slot shape so
+                        # main() can enter the rotating rerecap loop just like
+                        # a regular HOLD.
+                        out["slot"] = out.get("slot")
+                        out["recap"] = out.get("recap")
+                        out["result"] = "held_recap_only"  # rotation entry hook
+                    return out
+
                 log.info("--- slot discovery ---")
                 slot = await find_slot(f5, args.date, args.days_ahead, args.num,
                                        prefer_time_hhmm=args.time,
@@ -1672,6 +1861,21 @@ def parse_args():
     p.add_argument("--rerecap-cycles", type=int, default=0,
                    help="With --rerecap-min, max cycles before exit. 0 = unlimited "
                         "(runs until killed). Useful for finite tests.")
+    p.add_argument("--watch-drop-at", default="",
+                   help="SC2 drop-sniper mode: ISO datetime (naive = Rome time) "
+                        "when the target slot is expected to flip AVAILABLE. "
+                        "The bot pre-warms F5 before this time, polls "
+                        "/api/visit/timeavail tightly during the fire window, "
+                        "and POSTs /recap the moment our target time shows "
+                        "AVAILABLE. Combine with --date, --time, --num, "
+                        "and the ticket mix.")
+    p.add_argument("--watch-poll-sec", type=int, default=2,
+                   help="Polling interval (seconds) during the fire window. "
+                        "Default 2s. Lower = faster catch but more Evomi burn.")
+    p.add_argument("--watch-window-min", type=int, default=30,
+                   help="How long after drop_at to keep polling before giving "
+                        "up. Default 30 min (catches recycles — winners who "
+                        "don't pay in 15 min lose the slot back to the pool).")
     p.add_argument("--hybrid-keepalive", action="store_true",
                    help="HYBRID mode (recommended cheap hold): after /recap, "
                         "cycle cheap GETs for --hybrid-gets-per-session reads, "

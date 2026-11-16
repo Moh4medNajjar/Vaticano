@@ -569,6 +569,13 @@ INTERESTING = [
                                                                lambda m: f"⚠️ /reservation HTTP {m.group(1)} (attempt {m.group(2)}/3) — retrying"),
     (re.compile(r"HELD  ref=(\S+)\s+pay=(\S+)\s+total=(\S+)"),
                                                                lambda m: f"🏆 <b>LOCKED</b>\nref=<code>{m.group(1)}</code>\npay={m.group(2)}\ntotal=€{m.group(3)}"),
+    # SC2 WATCH milestones
+    (re.compile(r"👁 WATCH armed — target (\S+) (\S+)"),       lambda m: f"👁 WATCH armed · {m.group(1)} {m.group(2)}"),
+    (re.compile(r"👁 ENTERING FIRE WINDOW"),                   "🔥 fire window OPEN — tight polling"),
+    (re.compile(r"👁🔥 HIT at poll (\d+) — time=(\S+)"),       lambda m: f"🎯 HIT at poll {m.group(1)} · {m.group(2)} — firing /recap"),
+    (re.compile(r"👁✅ WON · reservationId=(\S+)"),             lambda m: f"🏆 <b>WON</b> · reservationId=<code>{m.group(1)}</code>"),
+    (re.compile(r"👁 fire (\d+) lost: (.+)"),                 lambda m: f"❌ fire {m.group(1)} lost ({m.group(2)[:120]}) — retry"),
+    (re.compile(r"👁 window expired"),                        "🏳️ fire window expired — nothing caught"),
     # Keepalive / rerecap progress lines are intentionally NOT forwarded to
     # Telegram — your mate asked to see only the catch + problems, not every
     # heartbeat. Problem signals below still fire.
@@ -2071,6 +2078,10 @@ HELP_TEXT = """🎯 <b>Vaticano Sniper — commands</b>
 /catch &lt;date&gt; [time] [tickets] [mode]
    e.g. /catch 2026-12-25 17:00 2full+1reduced+1audio hold
    Modes: hold (auto-refresh, no captcha) · live (1 captcha, instant pay)
+/watch &lt;target_date&gt; &lt;target_time&gt; &lt;drop_iso&gt; [tickets]
+   SC2 drop-sniper: catch the moment a SOLD_OUT slot flips AVAILABLE.
+   e.g. /watch 2026-12-25 11:00 2026-11-20T09:00 2full+1reduced
+   drop_iso is Rome time (naive) or ISO with +01:00 / +02:00 offset.
 /pay &lt;hold_id&gt;      — send a held slot to Catholica (1 captcha)
 /stop &lt;hold_id&gt;     — stop holding (alias: /release)
 /status [v]         — compact table (v = verbose)
@@ -2594,6 +2605,108 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @only_our_chat
+async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """SC2: drop-sniper. Catch a slot THE MOMENT it flips to AVAILABLE.
+
+    Usage:
+      /watch <target_date> <target_time> <drop_iso> [tickets]
+    Examples:
+      /watch 2026-12-25 11:00 2026-11-20T09:00 1reduced
+      /watch 2026-12-25 11:00 2026-11-20T09:00 2full+1reduced
+
+    target_date / target_time = the SLOT you want to grab
+    drop_iso                  = ISO datetime (Rome tz) when it'll flip AVAILABLE
+                                 e.g. 2026-11-20T09:00 or 2026-11-20T09:00:00+01:00
+    tickets                   = optional; default 1reduced
+    """
+    args = ctx.args or []
+    if len(args) < 3:
+        await _send(ctx,
+            "usage: <code>/watch &lt;target_date&gt; &lt;target_time&gt; "
+            "&lt;drop_iso&gt; [tickets]</code>\n\n"
+            "e.g. <code>/watch 2026-12-25 11:00 2026-11-20T09:00 2full+1reduced</code>\n\n"
+            "• target_date = the slot's date (YYYY-MM-DD)\n"
+            "• target_time = the slot's time (HH:MM or HH)\n"
+            "• drop_iso    = when the slot will flip AVAILABLE "
+            "(YYYY-MM-DDTHH:MM in Rome time)\n"
+            "• tickets     = optional, e.g. <code>1reduced</code> or <code>2full+1reduced+1audio</code>",
+            parse=ParseMode.HTML); return
+
+    target_date = args[0]
+    target_time = args[1]
+    drop_iso    = args[2]
+    tix_spec    = args[3] if len(args) > 3 else "1reduced"
+
+    # Validate dates
+    try: dt.datetime.strptime(target_date, "%Y-%m-%d")
+    except ValueError:
+        await _send(ctx, f"❌ bad target date '{target_date}' — use YYYY-MM-DD"); return
+    try:
+        # Accept plain ISO naive or offset
+        dt.datetime.fromisoformat(drop_iso.replace("Z","+00:00") if drop_iso.endswith("Z") else drop_iso)
+    except ValueError:
+        await _send(ctx, f"❌ bad drop ISO '{drop_iso}' — use YYYY-MM-DDTHH:MM"); return
+    if not re.fullmatch(r"\d{1,2}(:\d{2})?", target_time):
+        await _send(ctx, f"❌ bad target time '{target_time}' — use HH or HH:MM"); return
+
+    tickets = _parse_tickets_spec(tix_spec) or {"full": 0, "reduced": 1, "audio": 0}
+    if tickets["full"] + tickets["reduced"] < 1:
+        tickets["reduced"] = 1
+    total_tickets = tickets["full"] + tickets["reduced"]
+
+    # Only one non-hold run at a time
+    cur = _active_hold()
+    if cur and cur.kind == "live":
+        await _send(ctx, "⚠️ Another LIVE catch is running. /cancel it first."); return
+
+    # Build cmd — we spawn api_hold.py in hold_only mode with --watch-drop-at.
+    # Once the watch loop wins, main() enters the rotating rerecap loop
+    # automatically (result=held_recap_only + hold_only + rerecap_min>0).
+    cmd = [sys.executable, "api_hold.py",
+           "--date",             target_date,
+           "--num",              str(total_tickets),
+           "--days-ahead",       "0",
+           "--headless",
+           "--session-aging-sec","0",
+           "--rotate-ip",
+           "--ip-retries",       "5",
+           "--product",          "admission",
+           "--full",             str(tickets["full"]),
+           "--reduced",          str(tickets["reduced"]),
+           "--audio",            str(tickets["audio"]),
+           "--time",             target_time.split(":")[0],
+           "--strict-time",
+           "--no-low-availability",
+           "--hold-only",
+           "--rerecap-min",      "9",
+           "--rerecap-sess-cycles", "3",
+           "--rerecap-cycles",   "0",
+           "--watch-drop-at",    drop_iso,
+           "--watch-poll-sec",   "2",
+           "--watch-window-min", "30",
+           # Placeholder buyer (HOLD doesn't send it; real buyer set before /pay).
+           "--first",  "Guest", "--last", "Visitor",
+           "--email",  "guest@example.com", "--phone", "0000000000",
+           "--country","Italy", "--city", "Roma",
+           "--gender", "M",     "--birth", "1990-01-01"]
+
+    args_summary = (f"👁 WATCH {target_date} {target_time} · "
+                    f"drop@{drop_iso} · tix={tix_spec}")
+    slot_meta = {"date": target_date, "time": target_time.split(":")[0],
+                 "product": "admission",
+                 "full": tickets["full"], "reduced": tickets["reduced"],
+                 "audio": tickets["audio"], "num": total_tickets,
+                 "drop_at": drop_iso, "watch": True}
+    await _send(ctx, f"👁 arming WATCH: <b>{target_date} {target_time}</b> · "
+                     f"fire at <b>{drop_iso}</b> (Rome) · {tix_spec}",
+                parse=ParseMode.HTML)
+    await _spawn_api_hold_raw(ctx, kind="longhold", cmd=cmd,
+                              args_summary=args_summary,
+                              slot_meta=slot_meta,
+                              snapshot_glob="hold_*_watched*.json")
+
+
+@only_our_chat
 async def cmd_live(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """/live <hold_id> — stream that hold's new log lines for 5 min.
     /live — picks the most-recent live hold."""
@@ -2852,6 +2965,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("usage",       cmd_consumption))
     app.add_handler(CommandHandler("site",        cmd_site))
     app.add_handler(CommandHandler("refresh",     cmd_refresh))
+    app.add_handler(CommandHandler("watch",       cmd_watch))
     # Catch + hold lifecycle (carcere-style verbs)
     app.add_handler(CommandHandler("catch",    cmd_catch))
     app.add_handler(CommandHandler("held",     cmd_held))
