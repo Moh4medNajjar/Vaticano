@@ -252,6 +252,9 @@ class MenuSel:
     rerecap_min:  int = 9      # /recap refresh in minutes — 6-min safety margin
                                # before Vatican's ~15-min TTL cliff.
     rerecap_sess: int = 3      # /recap cycles per proxy before rotating (hold mode)
+    # SC2 /watch wizard state — the drop datetime (Rome tz)
+    drop_date:    str = ""     # YYYY-MM-DD when Vatican will release the slot
+    drop_time:    str = ""     # HH:MM Rome time (naive — the Python side converts)
     # Buyer — ALL empty by default. Your mate fills them in via the /buyer form
     # before tapping 💳 Pay. If any required field is empty when payment is
     # attempted, the bot refuses and sends them to the form.
@@ -294,6 +297,7 @@ def _save_menu_state() -> None:
         d = {str(cid): {k: getattr(m, k) for k in
                        ("date","time","product","full","reduced","audio","mode",
                         "keepalive","keepalive_min","rerecap_min","rerecap_sess",
+                        "drop_date","drop_time",
                         "first","last","email","phone","country","city","gender",
                         "birth","names")}
              for cid, m in MENU.items()}
@@ -857,14 +861,15 @@ def _launcher_text() -> str:
 
 
 def _launcher_kbd() -> InlineKeyboardMarkup:
-    """3x2 grid — sniper.js's 2x2 extended with a Buyer row (Vatican needs it)."""
+    """4x2 grid — sniper.js's 2x2 extended with Watch drop + Buyer rows."""
     jobs_n = len(_live_jobs())
     sel    = MENU.get(AUTHORIZED_CHAT) or MenuSel()
     buyer_tag = "✅" if not _buyer_missing(sel) else "⚠️"
     return kbd([
-        [("🎫 New hunt",    "cards"), (f"🎯 Jobs ({jobs_n})", "jobs")],
-        [("📊 Consumption", "cons"),  ("🌐 Site status",      "site")],
-        [(f"{buyer_tag} Buyer", "buyer_open"), ("❓ Help", "help_open")],
+        [("🎫 New hunt",       "cards"),     ("👁 Watch drop",       "watch_open")],
+        [(f"🎯 Jobs ({jobs_n})","jobs"),      ("📊 Consumption",      "cons")],
+        [("🌐 Site status",    "site"),      (f"{buyer_tag} Buyer",  "buyer_open")],
+        [("❓ Help",            "help_open")],
     ])
 
 
@@ -1210,6 +1215,141 @@ def _hunt_confirm(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
     return body, kbd(rows)
 
 
+# ── 6-step Watch-drop wizard (SC2) ─────────────────────────────────────
+# Reuses the 4 hunt steps (date/time/tix) + 2 extra steps for drop date+time.
+
+_DROP_HOURS = [
+    ("06:00", "06:00"), ("07:00", "07:00"), ("08:00", "08:00"),
+    ("09:00", "09:00"), ("10:00", "10:00"), ("11:00", "11:00"),
+    ("12:00", "12:00"), ("13:00", "13:00"), ("14:00", "14:00"),
+    ("15:00", "15:00"), ("16:00", "16:00"), ("17:00", "17:00"),
+    ("18:00", "18:00"), ("19:00", "19:00"), ("20:00", "20:00"),
+]
+
+
+def _watch_step1_tgt_date(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
+    center = sel.date or _menu_default_date()
+    txt = ("👁 <b>Watch drop · Step 1 of 6: Target date</b>\n\n"
+           "Which slot's date are you hunting?\n"
+           f"Showing days around <code>{center}</code>.")
+    # Reuse the hunt date keyboard but swap callback namespace to watch:
+    base = dt.date.fromisoformat(center)
+    days = [base + dt.timedelta(days=i) for i in range(-1, 7)]
+    r1 = [(d.strftime("%a %d/%m"), f"watch:date:set:{d.isoformat()}") for d in days[:4]]
+    r2 = [(d.strftime("%a %d/%m"), f"watch:date:set:{d.isoformat()}") for d in days[4:]]
+    prev7 = (base - dt.timedelta(days=7)).isoformat()
+    next7 = (base + dt.timedelta(days=7)).isoformat()
+    return txt, kbd([
+        r1, r2,
+        [("⏪ -7d", f"watch:date:nav:{prev7}"),
+         ("⏩ +7d", f"watch:date:nav:{next7}")],
+        [("↩ Back to menu", "main")],
+    ])
+
+
+def _watch_step2_tgt_time(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
+    rows = []
+    for label, val in _TIMES_PICKER:
+        tag = "● " if sel.time == val else "○ "
+        rows.append([(tag + label, f"watch:time:set:{val or 'any'}")])
+    rows.append([("↩ Back (date)", "watch:back:1")])
+    return (f"👁 <b>Watch drop · Step 2 of 6: Target time</b>\n\n"
+            f"📅 Target date: <code>{sel.date}</code>\n"
+            "Pick the slot's time:"), kbd(rows)
+
+
+def _watch_step3_tix(sel: MenuSel, custom: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+    time_label = next((lbl for lbl, v in _TIMES_PICKER if v == sel.time), "any")
+    header = (f"👁 <b>Watch drop · Step 3 of 6: Tickets</b>\n\n"
+              f"📅 Target: <code>{sel.date}</code> @ <code>{time_label}</code>\n\n")
+    if not custom:
+        rows = []
+        for label, triple in _TIX_PRESETS:
+            if triple is None:
+                rows.append([(label, "watch:tix:custom")])
+            else:
+                tag = "● " if (sel.full, sel.reduced, sel.audio) == triple else "○ "
+                rows.append([(tag + label, f"watch:tix:preset:{triple[0]}:{triple[1]}:{triple[2]}")])
+        rows.append([("↩ Back (time)", "watch:back:2")])
+        return header + "Pick a preset or Custom:", kbd(rows)
+    rows = [
+        [("🎫 Full €20", "noop"),    ("➖","watch:cust:full:dec"),  (str(sel.full),"noop"),    ("➕","watch:cust:full:inc")],
+        [("🎫 Reduced €10","noop"),  ("➖","watch:cust:red:dec"),   (str(sel.reduced),"noop"), ("➕","watch:cust:red:inc")],
+        [("🎧 Audio €8","noop"),     ("➖","watch:cust:audio:dec"), (str(sel.audio),"noop"),   ("➕","watch:cust:audio:inc")],
+        [("✅ Done — next (drop date)", "watch:tix:done")],
+        [("↩ Back (presets)",          "watch:back:3preset")],
+    ]
+    total = 20*sel.full + 10*sel.reduced + 5*(sel.full+sel.reduced) + 8*sel.audio
+    return (header + f"Custom tickets — tap ± to adjust.\n\n"
+                     f"👥 Visitors: <b>{sel.num}</b>\n"
+                     f"💶 Estimated: <b>€{total:.2f}</b>"), kbd(rows)
+
+
+def _watch_step4_drop_date(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
+    center = sel.drop_date or dt.date.today().isoformat()
+    base = dt.date.fromisoformat(center)
+    days = [base + dt.timedelta(days=i) for i in range(0, 8)]
+    r1 = [(d.strftime("%a %d/%m"), f"watch:drop:date:set:{d.isoformat()}") for d in days[:4]]
+    r2 = [(d.strftime("%a %d/%m"), f"watch:drop:date:set:{d.isoformat()}") for d in days[4:]]
+    prev7 = (base - dt.timedelta(days=7)).isoformat()
+    next7 = (base + dt.timedelta(days=7)).isoformat()
+    txt = (f"👁 <b>Watch drop · Step 4 of 6: Drop DATE</b>\n\n"
+           "Which day will Vatican release the slot? (Rome time)\n"
+           f"Showing days around <code>{center}</code>.")
+    return txt, kbd([
+        r1, r2,
+        [("⏪ -7d", f"watch:drop:date:nav:{prev7}"),
+         ("⏩ +7d", f"watch:drop:date:nav:{next7}")],
+        [("↩ Back (tickets)", "watch:back:3")],
+    ])
+
+
+def _watch_step5_drop_time(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
+    rows = []
+    row = []
+    for label, val in _DROP_HOURS:
+        tag = "●" if sel.drop_time == val else ""
+        row.append((tag + label, f"watch:drop:time:set:{val}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([("✏️ Custom time", "watch:drop:time:custom")])
+    rows.append([("↩ Back (drop date)", "watch:back:4")])
+    return (f"👁 <b>Watch drop · Step 5 of 6: Drop TIME</b>\n\n"
+            f"📆 Drop date: <code>{sel.drop_date}</code>\n"
+            "Pick the Rome-time hour Vatican will release:"), kbd(rows)
+
+
+def _watch_confirm(sel: MenuSel) -> tuple[str, InlineKeyboardMarkup]:
+    time_label = next((lbl for lbl, v in _TIMES_PICKER if v == sel.time), "any")
+    total = 20*sel.full + 10*sel.reduced + 5*sel.num + 8*sel.audio
+    body = ("👁 <b>Watch drop · Step 6 of 6: Confirm</b>\n\n"
+            f"🎯 <b>Target slot:</b> {sel.date}  "
+            f"{time_label}\n"
+            f"🎫 {sel.full}f + {sel.reduced}r"
+            + (f" + {sel.audio}a" if sel.audio else "")
+            + f"  ·  👥 {sel.num}  ·  <b>€{total:.2f}</b>\n\n"
+            f"⏰ <b>Drop time:</b> {sel.drop_date} {sel.drop_time} <i>Rome</i>\n\n"
+            "Bot will pre-warm F5 ~4 min before the drop, then tight-poll "
+            "every 2 s for up to 30 min to catch the first AVAILABLE.\n"
+            "<b>Zero captcha</b> until you later /pay.")
+    return body, kbd([
+        [("👁 ARM WATCH",   "watch:fire"),
+         ("↩ Back (time)", "watch:back:5")],
+    ])
+
+
+async def _render_watch_step(q, ctx: ContextTypes.DEFAULT_TYPE, builder, *args) -> None:
+    sel = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
+    if not sel.date:      sel.date      = _menu_default_date()
+    if not sel.drop_date: sel.drop_date = dt.date.today().isoformat()
+    txt, markup = builder(sel, *args)
+    try:
+        await q.message.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except Exception as exc:
+        log.debug("watch render failed: %s", exc)
+
+
 async def _open_catch_config(q, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Entry into the 4-step New-hunt wizard."""
     sel = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
@@ -1413,6 +1553,192 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         return
 
+    # ---------- 6-step /watch wizard (SC2) ----------
+    if parts[0] == "watch":
+        if not sel.date:      sel.date      = _menu_default_date()
+        if not sel.drop_date: sel.drop_date = dt.date.today().isoformat()
+        action = parts[1] if len(parts) > 1 else ""
+
+        # Back → step N
+        if action == "back":
+            where = parts[2] if len(parts) > 2 else "1"
+            if where == "1":       await _render_watch_step(q, ctx, _watch_step1_tgt_date); return
+            if where == "2":       await _render_watch_step(q, ctx, _watch_step2_tgt_time); return
+            if where == "3":       await _render_watch_step(q, ctx, _watch_step3_tix); return
+            if where == "3preset": await _render_watch_step(q, ctx, _watch_step3_tix, False); return
+            if where == "4":       await _render_watch_step(q, ctx, _watch_step4_drop_date); return
+            if where == "5":       await _render_watch_step(q, ctx, _watch_step5_drop_time); return
+            return
+
+        # Step 1 target date
+        if action == "date":
+            op = parts[2]
+            if op == "nav":
+                center = parts[3]
+                sel_tmp = sel  # render with the nav'd center but don't commit yet
+                base = dt.date.fromisoformat(center)
+                days = [base + dt.timedelta(days=i) for i in range(-1, 7)]
+                r1 = [(d.strftime("%a %d/%m"), f"watch:date:set:{d.isoformat()}") for d in days[:4]]
+                r2 = [(d.strftime("%a %d/%m"), f"watch:date:set:{d.isoformat()}") for d in days[4:]]
+                prev7 = (base - dt.timedelta(days=7)).isoformat()
+                next7 = (base + dt.timedelta(days=7)).isoformat()
+                try:
+                    await q.message.edit_text(
+                        f"👁 <b>Watch drop · Step 1 of 6: Target date</b>\n\n"
+                        f"Showing days around <code>{center}</code>.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=kbd([r1, r2,
+                            [("⏪ -7d", f"watch:date:nav:{prev7}"),
+                             ("⏩ +7d", f"watch:date:nav:{next7}")],
+                            [("↩ Back to menu", "main")]]))
+                except Exception: pass
+                return
+            if op == "set":
+                sel.date = parts[3]; _save_menu_state()
+                await _render_watch_step(q, ctx, _watch_step2_tgt_time); return
+
+        # Step 2 target time
+        if action == "time" and parts[2] == "set":
+            v = parts[3]
+            sel.time = "" if v == "any" else v
+            _save_menu_state()
+            await _render_watch_step(q, ctx, _watch_step3_tix); return
+
+        # Step 3 tickets
+        if action == "tix":
+            op = parts[2]
+            if op == "preset":
+                sel.full, sel.reduced, sel.audio = int(parts[3]), int(parts[4]), int(parts[5])
+                _save_menu_state()
+                await _render_watch_step(q, ctx, _watch_step4_drop_date); return
+            if op == "custom":
+                await _render_watch_step(q, ctx, _watch_step3_tix, True); return
+            if op == "done":
+                if sel.full + sel.reduced < 1:
+                    try: await q.answer("Pick at least one ticket!", show_alert=True)
+                    except Exception: pass
+                    return
+                if sel.audio > sel.num:
+                    sel.audio = sel.num
+                _save_menu_state()
+                await _render_watch_step(q, ctx, _watch_step4_drop_date); return
+        if action == "cust":
+            kind, op = parts[2], parts[3]
+            if kind == "full":
+                if op == "inc" and sel.full + sel.reduced < 6: sel.full += 1
+                elif op == "dec" and sel.full > 0: sel.full -= 1
+            elif kind == "red":
+                if op == "inc" and sel.full + sel.reduced < 6: sel.reduced += 1
+                elif op == "dec" and sel.reduced > 0: sel.reduced -= 1
+                if sel.full == 0 and sel.reduced == 0: sel.reduced = 1
+            elif kind == "audio":
+                if op == "inc" and sel.audio < sel.num: sel.audio += 1
+                elif op == "dec" and sel.audio > 0: sel.audio -= 1
+            _save_menu_state()
+            await _render_watch_step(q, ctx, _watch_step3_tix, True); return
+
+        # Step 4 drop date
+        if action == "drop" and parts[2] == "date":
+            op = parts[3]
+            if op == "nav":
+                center = parts[4]
+                base = dt.date.fromisoformat(center)
+                days = [base + dt.timedelta(days=i) for i in range(0, 8)]
+                r1 = [(d.strftime("%a %d/%m"), f"watch:drop:date:set:{d.isoformat()}") for d in days[:4]]
+                r2 = [(d.strftime("%a %d/%m"), f"watch:drop:date:set:{d.isoformat()}") for d in days[4:]]
+                prev7 = (base - dt.timedelta(days=7)).isoformat()
+                next7 = (base + dt.timedelta(days=7)).isoformat()
+                try:
+                    await q.message.edit_text(
+                        f"👁 <b>Watch drop · Step 4 of 6: Drop DATE</b>\n\n"
+                        f"Showing days around <code>{center}</code>.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=kbd([r1, r2,
+                            [("⏪ -7d", f"watch:drop:date:nav:{prev7}"),
+                             ("⏩ +7d", f"watch:drop:date:nav:{next7}")],
+                            [("↩ Back (tickets)", "watch:back:3")]]))
+                except Exception: pass
+                return
+            if op == "set":
+                sel.drop_date = parts[4]; _save_menu_state()
+                await _render_watch_step(q, ctx, _watch_step5_drop_time); return
+
+        # Step 5 drop time
+        if action == "drop" and parts[2] == "time":
+            op = parts[3]
+            if op == "set":
+                sel.drop_time = parts[4]; _save_menu_state()
+                await _render_watch_step(q, ctx, _watch_confirm); return
+            if op == "custom":
+                # Prompt for free-text drop time; reuse AWAITING pattern
+                AWAITING[AUTHORIZED_CHAT] = {"field": "__watch_drop_time__",
+                                             "return_to": "watch:5"}
+                try:
+                    await q.message.edit_text(
+                        "✏️ <b>Custom drop time</b>\n\n"
+                        "Send the drop time as HH:MM (Rome). "
+                        "Example: <code>14:30</code>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=kbd([[("↩ cancel", "watch:back:5")]]))
+                except Exception: pass
+                return
+
+        # Fire
+        if action == "fire":
+            # Build and launch — same shape as cmd_watch's spawn
+            if not (sel.date and sel.drop_date and sel.drop_time):
+                try: await q.answer("Missing date or drop time", show_alert=True)
+                except Exception: pass
+                return
+            drop_iso = f"{sel.drop_date}T{sel.drop_time}"
+            total_tickets = max(1, sel.full + sel.reduced)
+            cur = _active_hold()
+            if cur and cur.kind == "live":
+                await _send(ctx, "⚠️ Another LIVE catch is running. /cancel it first.")
+                return
+
+            cmd = [sys.executable, "api_hold.py",
+                   "--date", sel.date, "--num", str(total_tickets),
+                   "--days-ahead", "0", "--headless",
+                   "--session-aging-sec","0", "--rotate-ip", "--ip-retries", "5",
+                   "--product", "admission",
+                   "--full", str(sel.full),
+                   "--reduced", str(sel.reduced),
+                   "--audio", str(sel.audio),
+                   "--time", (sel.time or "0").split(":")[0] or "0",
+                   "--strict-time", "--no-low-availability",
+                   "--hold-only",
+                   "--rerecap-min", "9", "--rerecap-sess-cycles", "3",
+                   "--rerecap-cycles", "0",
+                   "--watch-drop-at", drop_iso,
+                   "--watch-poll-sec", "2", "--watch-window-min", "30",
+                   "--first","Guest","--last","Visitor","--email","guest@example.com",
+                   "--phone","0000000000","--country","Italy","--city","Roma",
+                   "--gender","M","--birth","1990-01-01"]
+            summary = (f"👁 WATCH {sel.date} {sel.time or 'any'} · "
+                       f"drop@{drop_iso} · f={sel.full} r={sel.reduced} a={sel.audio}")
+            slot_meta = {"date": sel.date, "time": sel.time or "",
+                         "product":"admission",
+                         "full":sel.full,"reduced":sel.reduced,"audio":sel.audio,
+                         "num":total_tickets,
+                         "drop_at": drop_iso, "watch": True}
+            try:
+                await q.message.edit_text(
+                    f"👁 Armed — <b>{sel.date} {sel.time or 'any'}</b> "
+                    f"· drop at <b>{drop_iso}</b> (Rome)\n"
+                    f"🎫 {sel.full}f + {sel.reduced}r"
+                    + (f" + {sel.audio}a" if sel.audio else ""),
+                    parse_mode=ParseMode.HTML)
+            except Exception: pass
+            _save_menu_state()
+            await _spawn_api_hold_raw(ctx, kind="longhold", cmd=cmd,
+                                      args_summary=summary,
+                                      slot_meta=slot_meta,
+                                      snapshot_glob="hold_*_watched*.json")
+            return
+
+        return
+
     if data == "help_open":
         try:
             await q.message.edit_text(
@@ -1422,6 +1748,10 @@ async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as exc:
             log.debug("help_open failed: %s", exc)
         return
+
+    if data == "watch_open":
+        # Enter the 6-step /watch wizard from the main menu
+        await _render_watch_step(q, ctx, _watch_step1_tgt_date); return
 
     # ---------- legacy top:* (kept so earlier messages still work) ----------
     if parts[0] == "top":
@@ -2495,6 +2825,26 @@ async def on_plain_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     field = waiting.get("field", "")
     return_to = waiting.get("return_to", "none")
+
+    # Special: watch wizard's custom drop-time entry
+    if field == "__watch_drop_time__":
+        AWAITING.pop(AUTHORIZED_CHAT, None)
+        if not re.fullmatch(r"\d{1,2}:\d{2}", text):
+            await _send(ctx,
+                "❌ bad format. Send drop time as <code>HH:MM</code> "
+                "(e.g. <code>14:30</code>). Open /watch to retry.",
+                parse=ParseMode.HTML); return
+        sel = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
+        # Normalise H:MM → HH:MM
+        h, m = text.split(":")
+        sel.drop_time = f"{int(h):02d}:{int(m):02d}"
+        _save_menu_state()
+        txt, markup = _watch_confirm(sel)
+        await ctx.bot.send_message(
+            chat_id=AUTHORIZED_CHAT, text=txt, parse_mode=ParseMode.HTML,
+            reply_markup=markup, disable_web_page_preview=True)
+        return
+
     spec = _BUYER_FIELD_SPEC.get(field)
     if not spec:
         AWAITING.pop(AUTHORIZED_CHAT, None); return
@@ -2621,16 +2971,16 @@ async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     args = ctx.args or []
     if len(args) < 3:
-        await _send(ctx,
-            "usage: <code>/watch &lt;target_date&gt; &lt;target_time&gt; "
-            "&lt;drop_iso&gt; [tickets]</code>\n\n"
-            "e.g. <code>/watch 2026-12-25 11:00 2026-11-20T09:00 2full+1reduced</code>\n\n"
-            "• target_date = the slot's date (YYYY-MM-DD)\n"
-            "• target_time = the slot's time (HH:MM or HH)\n"
-            "• drop_iso    = when the slot will flip AVAILABLE "
-            "(YYYY-MM-DDTHH:MM in Rome time)\n"
-            "• tickets     = optional, e.g. <code>1reduced</code> or <code>2full+1reduced+1audio</code>",
-            parse=ParseMode.HTML); return
+        # No args → open the 6-step wizard (same as tapping 👁 Watch drop in /menu)
+        sel = MENU.setdefault(AUTHORIZED_CHAT, MenuSel())
+        if not sel.date:      sel.date      = _menu_default_date()
+        if not sel.drop_date: sel.drop_date = dt.date.today().isoformat()
+        txt, markup = _watch_step1_tgt_date(sel)
+        await ctx.bot.send_message(
+            chat_id=AUTHORIZED_CHAT, text=txt,
+            parse_mode=ParseMode.HTML, reply_markup=markup,
+            disable_web_page_preview=True)
+        return
 
     target_date = args[0]
     target_time = args[1]
